@@ -1,0 +1,8 @@
+node_modules
+dist
+sessions
+creds_vault
+creds_backup_*.json
+settings_backup_*.json
+.env
+*.log

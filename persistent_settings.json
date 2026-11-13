@@ -1,0 +1,46 @@
+{
+    "254104634371": {
+        "autoreply": false,
+        "chatbot": false,
+        "autoread": false,
+        "autotyping": true,
+        "autorecording": false,
+        "autoreact": false,
+        "autoadd": false,
+        "alwaysonline": true,
+        "antilink": false,
+        "antispam": false,
+        "antimention": false,
+        "antitag": false,
+        "welcome": false,
+        "goodbye": false,
+        "autoviewstatus": false,
+        "antidelete": true,
+        "antideleteGroups": {
+            "120363413730065987@g.us": true
+        },
+        "autoviewonce": true,
+        "autoviewonceGroups": {
+            "120363413730065987@g.us": true
+        },
+        "antilinkGroups": {
+            "120363413730065987@g.us": true
+        },
+        "answerson": true,
+        "answersonGroups": {
+            "120363413730065987@g.us": true,
+            "120363405489407232@g.us": true
+        },
+        "bannedWords": [],
+        "groupBannedWords": {},
+        "groupSchedule": false,
+        "groupOpen": "08:00am",
+        "groupClose": "10:00pm",
+        "admins": [
+            "254111967697"
+        ],
+        "banList": [],
+        "ownerName": "Techwolf Assistant Bot",
+        "prefix": "."
+    }
+}
