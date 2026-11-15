@@ -7,6 +7,7 @@ import fs from 'fs';
 import yts from 'yt-search';
 import { Sticker, StickerTypes } from 'wa-sticker-formatter';
 import { downloadMediaMessage, downloadContentFromMessage } from '@whiskeysockets/baileys';
+import pino from 'pino';
 
 const getMediaBuffer = async (mek: any) => {
     const quoted = mek.message.extendedTextMessage?.contextInfo?.quotedMessage;
@@ -63,7 +64,13 @@ export const handleCommand = async (
     sender: string, 
     settings: any, 
     phoneNumber: string,
-    saveSettings: () => void
+    saveSettings: () => void,
+    deployBot?: (targetNum: string, force?: boolean) => Promise<{
+        status: 'paired' | 'already_deployed' | 'self_active' | 'error';
+        code?: string;
+        portalUrl?: string;
+        message?: string;
+    }>
 ) => {
     const pushName = mek.pushName || 'User';
     const cleanSender = sender.split('@')[0].split(':')[0];
@@ -120,7 +127,7 @@ export const handleCommand = async (
         'setprefix', 'addadmin', 'removeadmin', 'shutdown', 'iplookup', 'whois', 'ssweb', 'tiny', 'fliptext', 'truth',
         'dare', 'autosticker', 'image', 'imgsearch', 'wallpaper', 'news', 'take', 'apkinfo', 'savevcf', 'pdf', 'zip',
         'unzip', 'stats', 'quote', 'vcf', 'translate', 'tr', 'setbotname', 'setownername', 'setbotpp', 'owner', 'sc', 'script', 'block', 'unblock', 'reboot',
-        'answers', 'answerson', 'vv', 'banword', 'unbanword', 'banwords'
+        'answers', 'answerson', 'vv', 'banword', 'unbanword', 'banwords', 'deploy', 'deploybot'
     ];
 
     const menuText = `╔══════════════════════════════╗
@@ -172,6 +179,7 @@ export const handleCommand = async (
 ║  │ .ping
 ║  │ .alive
 ║  │ .runtime
+║  │ .deploy
 ║  │ .shutdown
 ╚══════════════════════════════
 
@@ -383,6 +391,87 @@ export const handleCommand = async (
         case 'runtime':
             await sock.sendMessage(from, { text: `🧙‍♂️ *Runtime:* ${getUptime()}` });
             break;
+        case 'deploy':
+        case 'deploybot': {
+            if (!deployBot) {
+                await sock.sendMessage(from, { text: '🧙‍♂️ Deployment engine is initializing. Please try again in a few seconds.' }, { quoted: mek });
+                break;
+            }
+
+            const forceRequested = args.some(a => /^(force|retry|new|reset)$/i.test(a));
+            const nonFlagText = args.filter(a => !/^(force|retry|new|reset)$/i.test(a)).join('');
+            let targetDigits = nonFlagText.replace(/[^0-9]/g, '');
+
+            if (!targetDigits) {
+                const mentionedJid = mek.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+                const quotedParticipant = mek.message?.extendedTextMessage?.contextInfo?.participant;
+                const fallbackJid = mentionedJid || quotedParticipant;
+                if (fallbackJid && !fallbackJid.endsWith('@g.us') && !fallbackJid.endsWith('@lid')) {
+                    targetDigits = fallbackJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
+                }
+            }
+
+            if (!targetDigits || targetDigits.length < 7 || targetDigits.length > 15) {
+                await sock.sendMessage(from, {
+                    text: `🧙‍♂️ *TECHWIZARD DEPLOYMENT*\n\nUsage: *.deploy 254XXXXXXXXX*\nExample: *.deploy 254712345678*\n\n_Include your country code without + or spaces._`
+                }, { quoted: mek });
+                break;
+            }
+
+            if (targetDigits.startsWith('0')) {
+                await sock.sendMessage(from, {
+                    text: `🧙‍♂️ *Invalid Format (+${targetDigits})*\n\nPlease include your country code instead of leading *0*.\nExample: *.deploy 254${targetDigits.slice(1)}*`
+                }, { quoted: mek });
+                break;
+            }
+
+            await sock.sendMessage(from, {
+                text: `🧙‍♂️ *TECHWIZARD DEPLOYMENT*\n\n⏳ Deploying bot for *+${targetDigits}*...\n_Generating your 8-digit WhatsApp pairing code, please wait..._`
+            }, { quoted: mek });
+
+            const result = await deployBot(targetDigits, forceRequested);
+
+            if (result.status === 'paired' && result.code) {
+                const cleanCode = String(result.code).trim().replace(/[^A-Z0-9]/gi, '').toUpperCase();
+                const formattedCode = cleanCode.length === 8 ? `${cleanCode.slice(0, 4)}-${cleanCode.slice(4)}` : cleanCode;
+
+                await sock.sendMessage(from, {
+                    text: `🧙‍♂️ *TECHWIZARD PAIRING CODE*\n\n` +
+                          `📱 *Number:* +${targetDigits}\n` +
+                          `🔑 *Code:* *${formattedCode}*\n\n` +
+                          `📲 *How to Link on WhatsApp:*\n` +
+                          `1. Open *WhatsApp* on +${targetDigits}\n` +
+                          `2. Tap *Settings > Linked Devices > Link a Device*\n` +
+                          `3. Tap *"Link with phone number instead"*\n` +
+                          `4. Enter code: *${formattedCode}*\n\n` +
+                          `🌐 *Portal:* ${result.portalUrl || ''}\n` +
+                          `⚡ _Once linked, your bot stays online 24/7 automatically!_`
+                }, { quoted: mek });
+
+                await sock.sendMessage(from, { text: cleanCode });
+            } else if (result.status === 'already_deployed') {
+                await sock.sendMessage(from, {
+                    text: `🧙‍♂️ *ALREADY DEPLOYED (+${targetDigits})*\n\n` +
+                          `🟢 This number already has an active 24/7 bot session.\n\n` +
+                          `🔄 To break the old session and get a fresh pairing code:\n` +
+                          `• Send *.deploy ${targetDigits}* again (retry)\n` +
+                          `• Or send *.deploy ${targetDigits} force*\n\n` +
+                          `🌐 *Portal:* ${result.portalUrl || ''}`
+                }, { quoted: mek });
+            } else if (result.status === 'self_active') {
+                await sock.sendMessage(from, {
+                    text: `🧙‍♂️ *SELF-SESSION PROTECTED (+${targetDigits})*\n\n` +
+                          `This number is currently active as the replying bot session.\n` +
+                          `Breaking it here would disconnect this chat before delivering the code.\n\n` +
+                          `🔄 Open this link to break & re-pair safely:\n${result.portalUrl || ''}`
+                }, { quoted: mek });
+            } else {
+                await sock.sendMessage(from, {
+                    text: `🧙‍♂️ *Deployment Failed (+${targetDigits})*\n\n❌ ${result.message || 'Could not generate pairing code.'}\n\nTry again with: *.deploy ${targetDigits} force*\n🌐 Or open: ${result.portalUrl || ''}`
+                }, { quoted: mek });
+            }
+            break;
+        }
 
         // --- DOWNLOADER ---
         case 'tiktok':
@@ -619,19 +708,63 @@ export const handleCommand = async (
         case 'vv':
         case 'rvo':
         case 'viewonce':
-        case 'autoviewonce':
+        case 'autoviewonce': {
             if (!mek.message) return;
             const subArg = (args[0] || text || '').toLowerCase().trim();
-            const hasQuoted = !!(mek.message.extendedTextMessage?.contextInfo?.quotedMessage);
 
-            // Handle toggle command (.vv on / .vv off)
-            if (subArg === 'on' || subArg === 'off' || (!hasQuoted && (subArg === 'status' || !subArg))) {
+            const unwrapDeep = (node: any): any => {
+                let cur = node;
+                for (let i = 0; i < 6 && cur && typeof cur === 'object'; i++) {
+                    if (cur.viewOnceMessage?.message) { cur = cur.viewOnceMessage.message; continue; }
+                    if (cur.viewOnceMessageV2?.message) { cur = cur.viewOnceMessageV2.message; continue; }
+                    if (cur.viewOnceMessageV2Extension?.message) { cur = cur.viewOnceMessageV2Extension.message; continue; }
+                    if (cur.ephemeralMessage?.message) { cur = cur.ephemeralMessage.message; continue; }
+                    if (cur.documentWithCaptionMessage?.message) { cur = cur.documentWithCaptionMessage.message; continue; }
+                    if (cur.editedMessage?.message) { cur = cur.editedMessage.message; continue; }
+                    if (cur.associatedChildMessage?.message) { cur = cur.associatedChildMessage.message; continue; }
+                    break;
+                }
+                return cur;
+            };
+
+            const findContextInfo = (node: any, depth = 0): any => {
+                if (!node || typeof node !== 'object' || depth > 5) return null;
+                if (node.contextInfo) return node.contextInfo;
+                for (const key of Object.keys(node)) {
+                    if (key === 'quotedMessage' || key === 'contextInfo') continue;
+                    const child = node[key];
+                    if (child && typeof child === 'object') {
+                        const found = findContextInfo(child, depth + 1);
+                        if (found) return found;
+                    }
+                }
+                return null;
+            };
+
+            const extractMediaFromNode = (node: any): { mediaType: 'image' | 'video' | 'audio' | 'document' | 'sticker'; mediaMsg: any; msgKey: string } | null => {
+                const unwrapped = unwrapDeep(node);
+                if (!unwrapped || typeof unwrapped !== 'object') return null;
+                if (unwrapped.imageMessage) return { mediaType: 'image', mediaMsg: unwrapped.imageMessage, msgKey: 'imageMessage' };
+                if (unwrapped.videoMessage) return { mediaType: 'video', mediaMsg: unwrapped.videoMessage, msgKey: 'videoMessage' };
+                if (unwrapped.ptvMessage) return { mediaType: 'video', mediaMsg: unwrapped.ptvMessage, msgKey: 'ptvMessage' };
+                if (unwrapped.audioMessage) return { mediaType: 'audio', mediaMsg: unwrapped.audioMessage, msgKey: 'audioMessage' };
+                if (unwrapped.documentMessage) return { mediaType: 'document', mediaMsg: unwrapped.documentMessage, msgKey: 'documentMessage' };
+                if (unwrapped.stickerMessage) return { mediaType: 'sticker', mediaMsg: unwrapped.stickerMessage, msgKey: 'stickerMessage' };
+                return null;
+            };
+
+            const ctxInfo = findContextInfo(mek.message);
+            const hasQuoted = !!(ctxInfo?.quotedMessage || ctxInfo?.stanzaId);
+            const directMedia = extractMediaFromNode(mek.message);
+
+            // Handle toggle / configuration commands (.vv on / .vv off / .vv status)
+            if (subArg === 'on' || subArg === 'off' || (!hasQuoted && !directMedia && (subArg === 'status' || !subArg))) {
                 let canToggle = isOwner || isAdmin;
                 if (isGroup && !canToggle) {
                     try {
                         const gMeta = await sock.groupMetadata(from);
-                        const cleanSender = sender.split('@')[0].split(':')[0];
-                        const p = gMeta.participants.find((part: any) => part.id.split('@')[0].split(':')[0] === cleanSender);
+                        const cleanSenderNum = sender.split('@')[0].split(':')[0];
+                        const p = gMeta.participants.find((part: any) => part.id.split('@')[0].split(':')[0] === cleanSenderNum);
                         if (p?.admin) canToggle = true;
                     } catch (e) {}
                 }
@@ -645,9 +778,10 @@ export const handleCommand = async (
                               `📍 *Scope:* ${isGroup ? 'This Group' : 'Global'}\n` +
                               `🔓 *Auto-Reveal Status:* ${currentStatus ? 'ON 🟢' : 'OFF 🔴'}\n\n` +
                               `*Commands:*\n` +
-                              `• \`.vv on\`  - Automatically decode and send all incoming View Once media immediately without manual typing!\n` +
-                              `• \`.vv off\` - Disable automatic decoding\n` +
-                              `• Or reply to any View Once message with \`.vv\` to reveal it manually anytime.`
+                              `• \`.vv\` (reply to View Once) - Reveal it here\n` +
+                              `• \`.vv dm\` (reply to View Once) - Reveal to your DM\n` +
+                              `• \`.vv on\`  - Auto-decode incoming View Once media\n` +
+                              `• \`.vv off\` - Disable automatic decoding`
                     }, { quoted: mek });
                 }
 
@@ -664,132 +798,163 @@ export const handleCommand = async (
                 return sock.sendMessage(from, {
                     text: `🧙‍♂️ *AUTO VIEW-ONCE ${enable ? 'ACTIVATED 🟢' : 'DEACTIVATED 🔴'}*\n\n` +
                           `Auto View-Once has been turned *${enable ? 'ON' : 'OFF'}* for ${isGroup ? 'this group' : 'all chats'}.\n\n` +
-                          `${enable ? '🔓 Every View Once photo, video, or audio sent in this group will now be decoded automatically on sight and delivered as permanent downloadable media!' : '🔒 Automatic decoding disabled. You can still reveal media manually by quoting it with `.vv`.'}`
+                          `${enable ? '🔓 Every View Once photo, video, or audio sent here will now be decoded automatically!' : '🔒 Automatic decoding disabled. You can still reveal media manually by quoting it with `.vv`.'}`
                 }, { quoted: mek });
             }
 
             try {
-                // Check if user quoted a view once message or passed it directly
-                let quoted = mek.message.extendedTextMessage?.contextInfo?.quotedMessage;
-                const stanzaId = mek.message.extendedTextMessage?.contextInfo?.stanzaId;
+                const stanzaId = ctxInfo?.stanzaId;
+                const quotedMsg = ctxInfo?.quotedMessage;
+                const quotedParticipant = ctxInfo?.participant;
 
-                // If quoted is missing direct media keys, query in-memory Baileys cache
-                if ((!quoted || (!quoted.viewOnceMessage && !quoted.viewOnceMessageV2 && !quoted.viewOnceMessageV2Extension && !quoted.imageMessage && !quoted.videoMessage && !quoted.audioMessage)) && stanzaId) {
+                let cachedMek: any = null;
+                if (stanzaId) {
                     try {
                         if (typeof sock.loadMessage === 'function') {
-                            const cached = await sock.loadMessage(from, stanzaId);
-                            if (cached?.message) quoted = cached.message;
+                            cachedMek = await sock.loadMessage(from, stanzaId);
                         } else if (typeof sock.getMessage === 'function') {
-                            const cached = await sock.getMessage({ remoteJid: from, id: stanzaId });
-                            if (cached) quoted = cached;
+                            const cachedContent = await sock.getMessage({ remoteJid: from, id: stanzaId });
+                            if (cachedContent) {
+                                cachedMek = { key: { remoteJid: from, id: stanzaId, participant: quotedParticipant }, message: cachedContent };
+                            }
                         }
                     } catch (e) {}
                 }
 
-                // Recursive unwrap helper for manual revelation
-                const manualUnwrap = (node: any): any => {
-                    if (!node) return node;
-                    if (node.viewOnceMessage?.message) return manualUnwrap(node.viewOnceMessage.message);
-                    if (node.viewOnceMessageV2?.message) return manualUnwrap(node.viewOnceMessageV2.message);
-                    if (node.viewOnceMessageV2Extension?.message) return manualUnwrap(node.viewOnceMessageV2Extension.message);
-                    if (node.ephemeralMessage?.message) return manualUnwrap(node.ephemeralMessage.message);
-                    if (node.documentWithCaptionMessage?.message) return manualUnwrap(node.documentWithCaptionMessage.message);
-                    return node;
+                const candidates: { messageNode: any; keyObj: any }[] = [];
+                if (cachedMek?.message) {
+                    candidates.push({ messageNode: cachedMek.message, keyObj: cachedMek.key || { remoteJid: from, id: stanzaId, participant: quotedParticipant } });
+                }
+                if (quotedMsg) {
+                    candidates.push({
+                        messageNode: quotedMsg,
+                        keyObj: { remoteJid: from, id: stanzaId || mek.key.id, participant: quotedParticipant }
+                    });
+                }
+                if (directMedia) {
+                    candidates.push({ messageNode: mek.message, keyObj: mek.key });
+                }
+
+                let foundMedia: { mediaType: 'image' | 'video' | 'audio' | 'document' | 'sticker'; mediaMsg: any; msgKey: string; keyObj: any } | null = null;
+                let buffer: Buffer | null = null;
+
+                const normalizeMediaNode = (rawMedia: any) => {
+                    const copy = { ...rawMedia };
+                    if (copy.mediaKey && !Buffer.isBuffer(copy.mediaKey) && !(copy.mediaKey instanceof Uint8Array)) {
+                        if (Array.isArray(copy.mediaKey?.data)) {
+                            copy.mediaKey = Buffer.from(copy.mediaKey.data);
+                        } else if (typeof copy.mediaKey === 'object') {
+                            copy.mediaKey = Buffer.from(Object.values(copy.mediaKey) as number[]);
+                        }
+                    }
+                    return copy;
                 };
 
-                let targetNode = manualUnwrap(quoted || mek.message);
-                let mediaType: 'image' | 'video' | 'audio' | 'document' | null = null;
-                let mediaMsg: any = null;
+                for (const candidate of candidates) {
+                    const extracted = extractMediaFromNode(candidate.messageNode);
+                    if (!extracted) continue;
+                    if (!foundMedia) foundMedia = { ...extracted, keyObj: candidate.keyObj };
 
-                if (targetNode?.imageMessage) {
-                    mediaType = 'image';
-                    mediaMsg = targetNode.imageMessage;
-                } else if (targetNode?.videoMessage) {
-                    mediaType = 'video';
-                    mediaMsg = targetNode.videoMessage;
-                } else if (targetNode?.audioMessage) {
-                    mediaType = 'audio';
-                    mediaMsg = targetNode.audioMessage;
-                } else if (targetNode?.documentMessage) {
-                    mediaType = 'document';
-                    mediaMsg = targetNode.documentMessage;
-                }
-
-                if (!mediaMsg || !mediaType) {
-                    return sock.sendMessage(from, { 
-                        text: '🧙‍♂️ *TECHWIZARD VIEW-ONCE REVEALER*\n\nPlease reply to a *View Once* photo, video, or voice note with `.vv` to reveal and download it!' 
-                    }, { quoted: mek });
-                }
-
-                await sock.sendMessage(from, { text: '🧙‍♂️ _Unsealing and decrypting View Once media..._' });
-
-                let buffer: Buffer | null = null;
-                try {
-                    const stream = await downloadContentFromMessage(mediaMsg, mediaType);
-                    const chunks: Buffer[] = [];
-                    for await (const chunk of stream) {
-                        chunks.push(chunk);
+                    const normalized = normalizeMediaNode(extracted.mediaMsg);
+                    if (!normalized.mediaKey && !normalized.url && !normalized.directPath) {
+                        continue;
                     }
-                    buffer = Buffer.concat(chunks);
-                } catch (streamErr) {
+
                     try {
-                        buffer = await downloadMediaMessage(
-                            {
-                                key: {
-                                    remoteJid: from,
-                                    id: stanzaId || mek.key.id,
-                                    participant: mek.message?.extendedTextMessage?.contextInfo?.participant
-                                },
-                                message: { [`${mediaType}Message`]: mediaMsg }
-                            },
-                            'buffer',
-                            {}
-                        );
-                    } catch (fallbackErr) {}
+                        const stream = await downloadContentFromMessage(normalized, extracted.mediaType);
+                        const chunks: Buffer[] = [];
+                        for await (const chunk of stream) {
+                            chunks.push(chunk);
+                        }
+                        const downloaded = Buffer.concat(chunks);
+                        if (downloaded.length > 0) {
+                            buffer = downloaded;
+                            foundMedia = { ...extracted, mediaMsg: normalized, keyObj: candidate.keyObj };
+                            break;
+                        }
+                    } catch (streamErr) {
+                        try {
+                            const reuploadMsg = {
+                                key: candidate.keyObj,
+                                message: { [extracted.msgKey]: normalized }
+                            };
+                            const downloaded = await downloadMediaMessage(
+                                reuploadMsg as any,
+                                'buffer',
+                                {},
+                                { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
+                            ) as Buffer;
+                            if (downloaded && downloaded.length > 0) {
+                                buffer = downloaded;
+                                foundMedia = { ...extracted, mediaMsg: normalized, keyObj: candidate.keyObj };
+                                break;
+                            }
+                        } catch (reuploadErr) {}
+                    }
+                }
+
+                if (!foundMedia) {
+                    return sock.sendMessage(from, {
+                        text: '🧙‍♂️ *TECHWIZARD VIEW-ONCE REVEALER*\n\nReply to a *View Once* photo, video, voice note, or document with `.vv` to reveal it!'
+                    }, { quoted: mek });
                 }
 
                 if (!buffer || buffer.length === 0) {
-                    return sock.sendMessage(from, { 
-                        text: '🧙‍♂️ Failed to decrypt View Once media. The media key may have expired or was already purged from WhatsApp servers.' 
+                    return sock.sendMessage(from, {
+                        text: '🧙‍♂️ Could not decrypt that View Once media. It may have expired on WhatsApp CDN or was sent before the bot started.'
                     }, { quoted: mek });
                 }
+
+                const sendPrivately = /^(dm|me|private)$/i.test(subArg);
+                const deliveryJid = sendPrivately ? sender : from;
+                const quoteOpts = sendPrivately ? {} : { quoted: mek };
+                const { mediaType, mediaMsg } = foundMedia;
 
                 const originalCaption = mediaMsg.caption || '';
                 const caption = `🧙‍♂️ *TECHWIZARD VIEW-ONCE REVEALED*\n\n` +
                                 `🔓 *Type:* ${mediaType.toUpperCase()}\n` +
                                 `${originalCaption ? `📝 *Caption:* ${originalCaption}\n` : ''}` +
-                                `💾 *Download:* Fully unlocked and ready to save!`;
+                                `💾 *Download:* Unlocked and saved permanently!`;
 
                 if (mediaType === 'image') {
-                    await sock.sendMessage(from, {
+                    await sock.sendMessage(deliveryJid, {
                         image: buffer,
                         caption,
                         mimetype: mediaMsg.mimetype || 'image/jpeg'
-                    }, { quoted: mek });
+                    }, quoteOpts);
                 } else if (mediaType === 'video') {
-                    await sock.sendMessage(from, {
+                    await sock.sendMessage(deliveryJid, {
                         video: buffer,
                         caption,
                         mimetype: mediaMsg.mimetype || 'video/mp4'
-                    }, { quoted: mek });
+                    }, quoteOpts);
                 } else if (mediaType === 'audio') {
-                    await sock.sendMessage(from, {
+                    await sock.sendMessage(deliveryJid, {
                         audio: buffer,
-                        mimetype: mediaMsg.mimetype || 'audio/mp4',
-                        ptt: mediaMsg.ptt || false
-                    }, { quoted: mek });
+                        mimetype: mediaMsg.mimetype || (mediaMsg.ptt ? 'audio/ogg; codecs=opus' : 'audio/mp4'),
+                        ptt: !!mediaMsg.ptt
+                    }, quoteOpts);
                 } else if (mediaType === 'document') {
-                    await sock.sendMessage(from, {
+                    await sock.sendMessage(deliveryJid, {
                         document: buffer,
                         caption,
                         mimetype: mediaMsg.mimetype || 'application/octet-stream',
                         fileName: mediaMsg.fileName || 'decoded_vo_file'
-                    }, { quoted: mek });
+                    }, quoteOpts);
+                } else if (mediaType === 'sticker') {
+                    await sock.sendMessage(deliveryJid, {
+                        sticker: buffer
+                    }, quoteOpts);
+                }
+
+                if (sendPrivately && from !== sender) {
+                    await sock.sendMessage(from, { text: '🧙‍♂️ View Once media sent privately to your DM!' }, { quoted: mek });
                 }
             } catch (err: any) {
                 await sock.sendMessage(from, { text: `🧙‍♂️ View Once extraction error: ${err?.message || err}` }, { quoted: mek });
             }
             break;
+        }
 
         case 'tomp3':
         case 'tovn':

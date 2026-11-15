@@ -235,8 +235,88 @@ async function startServer() {
     const connectingStates: { [phone: string]: boolean } = {};
     const botSocks: { [phone: string]: any } = {};
     const reconnectAttempts: { [num: string]: number } = {};
+    const reconnectTimers: { [num: string]: NodeJS.Timeout } = {};
+    const presenceIntervals: { [num: string]: NodeJS.Timeout } = {};
+    const backoffUntil: { [num: string]: number } = {};
+    const pairingPendingUntil: { [num: string]: number } = {};
+    const pingFailures: { [num: string]: number } = {};
     const globalProcessedMessageIds = new Set<string>();
     const globalProcessedMsgTimestamps = new Map<string, number>();
+
+    const isSockConnected = (sock: any): boolean => {
+        if (!sock || !sock.user) return false;
+        if (sock.ws) {
+            if (sock.ws.isClosed || sock.ws.isClosing) return false;
+            if (typeof sock.ws.isOpen === 'boolean') return sock.ws.isOpen;
+        }
+        return true;
+    };
+
+    const isSockAlive = (sock: any): boolean => {
+        if (!sock) return false;
+        if (sock.ws) {
+            return !sock.ws.isClosed && !sock.ws.isClosing;
+        }
+        return true;
+    };
+
+    const hasRegisteredSession = (num: string): boolean => {
+        const candidates = [
+            path.join('./sessions', num, 'creds.json'),
+            path.join('./creds_vault', num, 'creds.json')
+        ];
+        for (const file of candidates) {
+            if (fs.existsSync(file)) {
+                try {
+                    const creds = fs.readJsonSync(file);
+                    if (creds && creds.registered === true) {
+                        return true;
+                    }
+                } catch (e) {}
+            }
+        }
+        return false;
+    };
+
+    async function breakSession(num: string, reason = 'Resetting session') {
+        addLog(`Breaking session for +${num} (${reason})...`, 'system');
+
+        if (reconnectTimers[num]) {
+            clearTimeout(reconnectTimers[num]);
+            delete reconnectTimers[num];
+        }
+        if (presenceIntervals[num]) {
+            clearInterval(presenceIntervals[num]);
+            delete presenceIntervals[num];
+        }
+        delete backoffUntil[num];
+        delete pairingPendingUntil[num];
+        delete pingFailures[num];
+        delete reconnectAttempts[num];
+        delete connectingStates[num];
+
+        if (botSocks[num]) {
+            const oldSock = botSocks[num];
+            delete botSocks[num];
+            try {
+                oldSock.ev.removeAllListeners();
+                oldSock.end(undefined);
+            } catch (e) {}
+        }
+
+        const sessionPath = `./sessions/${num}`;
+        const vaultPath = `./creds_vault/${num}`;
+        if (fs.existsSync(sessionPath)) {
+            try {
+                await fs.remove(sessionPath);
+            } catch (e) {}
+        }
+        if (fs.existsSync(vaultPath)) {
+            try {
+                await fs.remove(vaultPath);
+            } catch (e) {}
+        }
+    }
 
     app.use(cors());
     app.use(express.json());
@@ -247,11 +327,21 @@ async function startServer() {
     });
 
     const activePairingRequests: { [num: string]: Promise<string> } = {};
+    const pendingDeployRetries = new Map<string, number>();
 
-    async function getPairingCode(num: string): Promise<string> {
-        if (num in activePairingRequests) {
+    const getPortalBaseUrl = () => {
+        const rawPublic = process.env.PUBLIC_URL || process.env.APP_URL || process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_STATIC_URL || 'https://techwizard-bot-production.up.railway.app';
+        return (rawPublic.startsWith('http') ? rawPublic : `https://${rawPublic}`).replace(/\/$/, '');
+    };
+
+    async function getPairingCode(num: string, forceBreak = false): Promise<string> {
+        if (!forceBreak && num in activePairingRequests) {
             addLog(`Using existing pairing promise for +${num}`, 'network');
             return activePairingRequests[num];
+        }
+
+        if (forceBreak) {
+            delete activePairingRequests[num];
         }
 
         const pairingPromise = new Promise<string>((resolve, reject) => {
@@ -295,6 +385,52 @@ async function startServer() {
         return pairingPromise;
     }
 
+    async function deployNumberFromCommand(
+        targetNum: string,
+        requesterPhone: string,
+        force = false
+    ): Promise<{ status: 'paired' | 'already_deployed' | 'self_active' | 'error'; code?: string; portalUrl?: string; message?: string }> {
+        const portalBase = getPortalBaseUrl();
+        const cleanRequester = requesterPhone.split('@')[0].split(':')[0];
+
+        if (targetNum === cleanRequester && isSockConnected(botSocks[targetNum])) {
+            return {
+                status: 'self_active',
+                portalUrl: `${portalBase}/code/${targetNum}?force=true`
+            };
+        }
+
+        const retryAt = pendingDeployRetries.get(targetNum);
+        const isWithinRetryWindow = !!retryAt && (Date.now() - retryAt < 180000);
+        const isAlreadyRegistered = hasRegisteredSession(targetNum);
+        const isCurrentlyConnected = isSockConnected(botSocks[targetNum]);
+
+        if (isAlreadyRegistered && isCurrentlyConnected && !force && !isWithinRetryWindow) {
+            pendingDeployRetries.set(targetNum, Date.now());
+            return {
+                status: 'already_deployed',
+                portalUrl: `${portalBase}/code/${targetNum}?force=true`
+            };
+        }
+
+        pendingDeployRetries.delete(targetNum);
+        try {
+            addLog(`.deploy command generating pairing code for +${targetNum} (requested by +${cleanRequester})`, 'network');
+            const code = await getPairingCode(targetNum, true);
+            return {
+                status: 'paired',
+                code,
+                portalUrl: `${portalBase}/code/${targetNum}`
+            };
+        } catch (err: any) {
+            return {
+                status: 'error',
+                portalUrl: `${portalBase}/code/${targetNum}?force=true`,
+                message: err?.message === 'PAIRING_TIMEOUT' ? 'Timed out generating code. Try again.' : (err?.message || 'Pairing failed.')
+            };
+        }
+    }
+
     // Root route handler - handles direct pairing requests via ?number=... or ?...
     app.get('/', async (req, res, next) => {
         try {
@@ -312,17 +448,19 @@ async function startServer() {
                 const num = numberParam.replace(/[^0-9]/g, '');
                 if (num.length >= 5) {
                     try {
-                        addLog(`Pairing Request received for +${num}`, 'network');
-                        const sessionPath = `./sessions/${num}`;
-                        if (fs.existsSync(path.join(sessionPath, 'creds.json'))) {
-                            addLog(`Session already exists for +${num}.`, 'system');
-                            startBot(num, false).catch(() => {});
+                        const isForce = req.query.force === 'true' || req.query.retry === 'true' || req.query.new === 'true' || req.query.reconnect === 'true';
+                        addLog(`Pairing Request received for +${num}${isForce ? ' (Force Re-Pair)' : ''}`, 'network');
+                        if (!isForce && hasRegisteredSession(num)) {
+                            addLog(`Session already exists for +${num}. Waking connection...`, 'system');
+                            if (!isSockConnected(botSocks[num]) && !connectingStates[num]) {
+                                startBot(num, false).catch(() => {});
+                            }
                             if (!res.headersSent) {
                                 res.setHeader('Content-Type', 'text/plain');
                                 return res.status(200).send('ALREADY_PAIRED');
                             }
                         }
-                        const code = await getPairingCode(num);
+                        const code = await getPairingCode(num, isForce);
                         if (!res.headersSent) {
                             res.setHeader('Content-Type', 'text/plain');
                             return res.status(200).send(code);
@@ -351,16 +489,20 @@ async function startServer() {
         const number = (req.query.number as string) || (req.query[''] as string);
         if (!number) return res.status(400).send('Phone number required');
         const num = number.replace(/[^0-9]/g, '');
+        if (num.length < 5) return res.status(400).send('Valid phone number required');
 
-        const sessionPath = `./sessions/${num}`;
-        if (fs.existsSync(path.join(sessionPath, 'creds.json'))) {
-            startBot(num, false).catch(() => {});
+        const isForce = req.query.force === 'true' || req.query.retry === 'true' || req.query.new === 'true' || req.query.reconnect === 'true';
+
+        if (!isForce && hasRegisteredSession(num)) {
+            if (!isSockConnected(botSocks[num]) && !connectingStates[num]) {
+                startBot(num, false).catch(() => {});
+            }
             res.setHeader('Content-Type', 'text/plain');
             return res.send('ALREADY_PAIRED');
         }
 
         try {
-            const code = await getPairingCode(num);
+            const code = await getPairingCode(num, isForce);
             res.setHeader('Content-Type', 'text/plain');
             res.send(code);
         } catch (e: any) {
@@ -403,13 +545,11 @@ async function startServer() {
         }
 
         const isHtml = req.headers.accept?.includes('text/html') && req.query.raw !== '1' && req.query.format !== 'text';
-        const isForce = req.query.force === 'true' || req.query.new === 'true' || req.query.reconnect === 'true';
-        const sessionPath = `./sessions/${num}`;
-        const credsFile = path.join(sessionPath, 'creds.json');
-        const isConnected = !!(botSocks[num] && botSocks[num].ws?.readyState === 1);
+        const isForce = req.query.force === 'true' || req.query.retry === 'true' || req.query.new === 'true' || req.query.reconnect === 'true';
+        const isConnected = isSockConnected(botSocks[num]);
 
-        if (fs.existsSync(credsFile) && !isForce) {
-            if (!botSocks[num]) {
+        if (hasRegisteredSession(num) && !isForce) {
+            if (!isConnected && !connectingStates[num]) {
                 startBot(num, false).catch(() => {});
             }
             if (isHtml) {
@@ -435,14 +575,33 @@ async function startServer() {
 <body>
     <div class="card">
         <div class="badge"><span class="status-dot"></span> HOSTED 24/7 ON RAILWAY</div>
-        <h1 class="title">✅ BOT ALREADY ACTIVE</h1>
+        <h1 class="title">${isConnected ? '✅ BOT ALREADY ACTIVE' : '⚡ WAKING BOT SESSION'}</h1>
         <p class="phone">WhatsApp account for <strong>+${num}</strong> is paired and running 24/7 on Railway cloud!</p>
         <div class="status-box">
-            <p style="color:#22c55e; font-weight: bold; margin-bottom: 6px;">🟢 Connection Status: Fully Online</p>
+            <p id="statusText" style="color:${isConnected ? '#22c55e' : '#f59e0b'}; font-weight: bold; margin-bottom: 6px;">
+                ${isConnected ? '🟢 Connection Status: Fully Online' : '🟡 Connection Status: Connecting / Re-syncing...'}
+            </p>
             <p style="color:#94a3b8; font-size: 13px;">Auto-reconnect & Watchdog active. All commands ready.</p>
         </div>
-        <a href="?force=true" class="btn">🔄 Re-link or Generate New Code</a>
+        <a href="?force=true" class="btn">🔄 Break Session &amp; Generate New Code</a>
     </div>
+    <script>
+        setInterval(() => {
+            fetch('/api/status').then(r => r.json()).then(data => {
+                const s = data?.sessions?.find(x => x.phoneNumber === '${num}');
+                const el = document.getElementById('statusText');
+                const title = document.querySelector('.title');
+                if (s && s.connected) {
+                    el.style.color = '#22c55e';
+                    el.innerText = '🟢 Connection Status: Fully Online';
+                    title.innerText = '✅ BOT ALREADY ACTIVE';
+                } else {
+                    el.style.color = '#f59e0b';
+                    el.innerText = '🟡 Connection Status: Reconnecting...';
+                }
+            }).catch(() => {});
+        }, 3000);
+    </script>
 </body>
 </html>`);
             }
@@ -451,8 +610,8 @@ async function startServer() {
         }
 
         try {
-            addLog(`Direct pairing code requested for +${num}`, 'network');
-            const code = await getPairingCode(num);
+            addLog(`Direct pairing code requested for +${num}${isForce ? ' (Force Re-Pair)' : ''}`, 'network');
+            const code = await getPairingCode(num, isForce);
             const cleanCode = String(code).trim().replace(/[^A-Z0-9]/gi, '').toUpperCase();
             const formattedCode = cleanCode.length === 8 ? `${cleanCode.slice(0, 4)}-${cleanCode.slice(4)}` : cleanCode;
 
@@ -517,7 +676,7 @@ async function startServer() {
             fetch('/api/status').then(r => r.json()).then(data => {
                 if (data?.sessions?.some(s => s.phoneNumber === '${num}' && s.connected)) {
                     document.querySelector('.title').innerText = '🎉 BOT CONNECTED!';
-                    document.querySelector('.phone').innerHTML = '<span style="color:#22c55e;font-weight:bold">Active & Online 24/7! You can close this page.</span>';
+                    document.querySelector('.phone').innerHTML = '<span style="color:#22c55e;font-weight:bold">Active &amp; Online 24/7! You can close this page.</span>';
                 }
             }).catch(() => {});
         }, 3000);
@@ -533,7 +692,7 @@ async function startServer() {
             addLog(`Pairing dispatch error for +${num}: ${errMsg}`, 'error');
             if (isHtml) {
                 res.setHeader('Content-Type', 'text/html; charset=utf-8');
-                return res.status(500).send(`<!DOCTYPE html><html><body style="background:#0f172a;color:#f87171;font-family:sans-serif;padding:30px;text-align:center;"><h2>❌ Pairing Error</h2><p style="color:#cbd5e1">${errMsg}</p><br><a href="" style="color:#38bdf8">Try Again</a></body></html>`);
+                return res.status(500).send(`<!DOCTYPE html><html><body style="background:#0f172a;color:#f87171;font-family:sans-serif;padding:30px;text-align:center;"><h2>❌ Pairing Error</h2><p style="color:#cbd5e1">${errMsg}</p><br><a href="?force=true" style="color:#38bdf8">Try Again (Break Session &amp; Re-Pair)</a></body></html>`);
             }
             res.setHeader('Content-Type', 'text/plain; charset=utf-8');
             return res.status(500).send(errMsg);
@@ -546,53 +705,40 @@ async function startServer() {
 
     app.get('/api/logs', (req, res) => res.json(logBuffer));
 
-    app.post('/api/disconnect', (req, res) => {
+    app.post('/api/disconnect', async (req, res) => {
         const { phoneNumber } = req.body || req.query;
         if (!phoneNumber) return res.status(400).json({ error: 'Phone number required' });
-        const num = phoneNumber.replace(/[^0-9]/g, '');
+        const num = String(phoneNumber).replace(/[^0-9]/g, '');
 
         addLog(`Force disconnect requested for +${num}`, 'system');
-
-        // Close socket
-        if (botSocks[num]) {
-            try {
-                botSocks[num].ev.removeAllListeners();
-                botSocks[num].end(undefined);
-                delete botSocks[num];
-                addLog(`Closed socket for +${num}`, 'system');
-            } catch (e) {}
-        }
-        delete connectingStates[num];
-
-        // Delete session directory
-        const sessionPath = `./sessions/${num}`;
-        if (fs.existsSync(sessionPath)) {
-            try {
-                fs.rmSync(sessionPath, { recursive: true, force: true });
-                addLog(`Deleted session folder for +${num}`, 'system');
-            } catch (e) {
-                addLog(`Failed to delete session directory for +${num}: ${e}`, 'error');
-            }
-        }
+        await breakSession(num, 'Manual Disconnect');
 
         res.json({ success: true, message: `Successfully disconnected and deleted session for +${num}` });
     });
 
     app.get('/api/status', (req, res) => {
         const sessionPath = './sessions';
-        const sessions: { phoneNumber: string, connected: boolean }[] = [];
-        if (fs.existsSync(sessionPath)) {
+        const sessions: { phoneNumber: string, connected: boolean, connecting: boolean }[] = [];
+        const seen = new Set<string>();
+        const collectFrom = (baseDir: string) => {
+            if (!fs.existsSync(baseDir)) return;
             try {
-                fs.readdirSync(sessionPath).forEach(folder => {
-                    if (fs.existsSync(path.join(sessionPath, folder, 'creds.json'))) {
+                fs.readdirSync(baseDir).forEach(folder => {
+                    if (seen.has(folder)) return;
+                    const cPath = path.join(baseDir, folder, 'creds.json');
+                    if (fs.existsSync(cPath)) {
+                        seen.add(folder);
                         sessions.push({
                             phoneNumber: folder,
-                            connected: !!botSocks[folder]
+                            connected: isSockConnected(botSocks[folder]),
+                            connecting: !!connectingStates[folder]
                         });
                     }
                 });
             } catch (e) {}
-        }
+        };
+        collectFrom(sessionPath);
+        collectFrom('./creds_vault');
         res.json({
             sessions,
             uptime: process.uptime()
@@ -600,34 +746,44 @@ async function startServer() {
     });
 
     async function startBot(phoneNumber: string, isNewPairing = false) {
-        if (botSocks[phoneNumber]) {
-            try {
-                botSocks[phoneNumber].ev.removeAllListeners();
-                botSocks[phoneNumber].end(undefined);
-            } catch (e) {}
-            delete botSocks[phoneNumber];
+        if (reconnectTimers[phoneNumber]) {
+            clearTimeout(reconnectTimers[phoneNumber]);
+            delete reconnectTimers[phoneNumber];
+        }
+        if (presenceIntervals[phoneNumber]) {
+            clearInterval(presenceIntervals[phoneNumber]);
+            delete presenceIntervals[phoneNumber];
         }
 
-        if (connectingStates[phoneNumber] && !isNewPairing) {
-            // Safety: If stuck in 'connecting' for > 30s, allow a new attempt
+        if (!isNewPairing && connectingStates[phoneNumber]) {
+            // Safety: If stuck in 'connecting' for > 35s, allow a new attempt
             const lastAttempt = (connectingStates as any)[`${phoneNumber}_time`] || 0;
-            if (Date.now() - lastAttempt < 30000) return;
+            if (Date.now() - lastAttempt < 35000) return;
             addLog(`Wizard: +${phoneNumber} connection attempt timed out. Retrying...`, 'network');
         }
-        
-        connectingStates[phoneNumber] = true;
-        (connectingStates as any)[`${phoneNumber}_time`] = Date.now();
 
-        const sessionPath = `./sessions/${phoneNumber}`;
-        if (isNewPairing && fs.existsSync(sessionPath)) {
-            await fs.remove(sessionPath);
+        if (isNewPairing) {
+            await breakSession(phoneNumber, 'New Pairing / Re-Pair');
+            pairingPendingUntil[phoneNumber] = Date.now() + 120000;
+        } else if (botSocks[phoneNumber]) {
+            const oldSock = botSocks[phoneNumber];
+            delete botSocks[phoneNumber];
+            try {
+                oldSock.ev.removeAllListeners();
+                oldSock.end(undefined);
+            } catch (e) {}
         }
 
+        connectingStates[phoneNumber] = true;
+        (connectingStates as any)[`${phoneNumber}_time`] = Date.now();
+        delete backoffUntil[phoneNumber];
+
+        const sessionPath = `./sessions/${phoneNumber}`;
         await fs.ensureDir(sessionPath);
 
         const vaultCreds = `./creds_vault/${phoneNumber}/creds.json`;
         const credsFile = path.join(sessionPath, 'creds.json');
-        if (!fs.existsSync(credsFile) && fs.existsSync(vaultCreds)) {
+        if (!isNewPairing && !fs.existsSync(credsFile) && fs.existsSync(vaultCreds)) {
             try {
                 fs.copySync(vaultCreds, credsFile);
                 addLog(`Credential Vault: Auto-restored session creds for +${phoneNumber}`, 'system');
@@ -673,6 +829,7 @@ async function startServer() {
 
         const msgRetryCounterCache = new NodeCache({ stdTTL: 5 * 60, useClones: false });
         const messageCache = new Map<string, any>();
+        const viewOnceCache = new Map<string, any>();
         const botDeletedMessageIds = new Set<string>();
 
         const sock = makeWASocket({
@@ -688,9 +845,9 @@ async function startServer() {
             syncFullHistory: false,
             generateHighQualityLinkPreview: true,
             markOnlineOnConnect: true,
-            keepAliveIntervalMs: 10000,
-            connectTimeoutMs: 30000,
-            defaultQueryTimeoutMs: 30000,
+            keepAliveIntervalMs: 15000,
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
             emitOwnEvents: true,
             appStateMacVerification: {
                 patch: false,
@@ -702,6 +859,9 @@ async function startServer() {
             // Improved getMessage for better decryption resilience
             getMessage: async (key) => {
                 const id = key.id;
+                if (id && viewOnceCache.has(id)) {
+                    return viewOnceCache.get(id)?.message || undefined;
+                }
                 if (id && messageCache.has(id)) {
                     const cached = messageCache.get(id);
                     return cached?.message || undefined;
@@ -770,6 +930,11 @@ async function startServer() {
             }, { quoted: message });
         };
 
+        (sock as any).loadMessage = async (_jid: string, id: string) => {
+            if (!id) return undefined;
+            return viewOnceCache.get(id) || messageCache.get(id);
+        };
+
         botSocks[phoneNumber] = sock;
 
         if (isNewPairing && !state.creds.registered) {
@@ -829,19 +994,33 @@ async function startServer() {
                 addLog(`🧙‍♂️ TECHWIZARD ONLINE: +${phoneNumber}`, 'system');
                 connectingStates[phoneNumber] = false;
                 reconnectAttempts[phoneNumber] = 0;
+                pingFailures[phoneNumber] = 0;
+                delete backoffUntil[phoneNumber];
+                delete pairingPendingUntil[phoneNumber];
 
-                // Auto Join Official Community Group
-                const inviteCode = 'EhiFIIYPxZM5jTUfXYH8M9';
+                // Mirror latest registered creds immediately to vault
                 try {
-                    await sock.groupAcceptInvite(inviteCode);
+                    const vaultDir = `./creds_vault/${phoneNumber}`;
+                    fs.ensureDirSync(vaultDir);
+                    if (fs.existsSync(credsFile)) {
+                        fs.copySync(credsFile, path.join(vaultDir, 'creds.json'));
+                    }
                 } catch (e) {}
 
-                // Auto Follow Channel
-                const channelInvite = '0029Vb6Vxo960eBmxo0Q5z0Z';
-                try {
-                    const meta = await (sock as any).newsletterMetadata('invite', channelInvite);
-                    if (meta?.id) await (sock as any).newsletterFollow(meta.id);
-                } catch (e) {}
+                if (isNewPairing) {
+                    // Auto Join Official Community Group (only on initial pairing)
+                    const inviteCode = 'EhiFIIYPxZM5jTUfXYH8M9';
+                    try {
+                        await sock.groupAcceptInvite(inviteCode);
+                    } catch (e) {}
+
+                    // Auto Follow Channel (only on initial pairing)
+                    const channelInvite = '0029Vb6Vxo960eBmxo0Q5z0Z';
+                    try {
+                        const meta = await (sock as any).newsletterMetadata('invite', channelInvite);
+                        if (meta?.id) await (sock as any).newsletterFollow(meta.id);
+                    } catch (e) {}
+                }
 
                 const settings = getSettings(phoneNumber);
                 if (sock.user?.name && !settings.ownerName) {
@@ -859,19 +1038,18 @@ async function startServer() {
                     try { await sock.sendPresenceUpdate('available'); } catch (e) {}
                 }
 
-                // Periodic Presence Refresh for Always Online (Stabilized: every 30s)
-                const presenceInterval = setInterval(async () => {
+                if (presenceIntervals[phoneNumber]) {
+                    clearInterval(presenceIntervals[phoneNumber]);
+                }
+                // Periodic Presence Refresh for Always Online (Stabilized: every 45s)
+                presenceIntervals[phoneNumber] = setInterval(async () => {
                     try {
                         const currentSettings = getSettings(phoneNumber);
-                        if (currentSettings.alwaysonline && sock.user) {
+                        if (currentSettings.alwaysonline && isSockConnected(sock)) {
                             await sock.sendPresenceUpdate('available');
                         }
                     } catch (e) {}
-                }, 30000);
-
-                sock.ev.on('connection.update', (upd) => {
-                    if (upd.connection === 'close') clearInterval(presenceInterval);
-                });
+                }, 45000);
 
                 // Send a beautifully styled deployment message to the linked owner on initial pairing
                 if (isNewPairing) {
@@ -906,6 +1084,19 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
             }
 
             if (connection === 'close') {
+                // Ignore stale close events from a replaced socket
+                if (botSocks[phoneNumber] && botSocks[phoneNumber] !== sock) {
+                    return;
+                }
+
+                if (presenceIntervals[phoneNumber]) {
+                    clearInterval(presenceIntervals[phoneNumber]);
+                    delete presenceIntervals[phoneNumber];
+                }
+                if (botSocks[phoneNumber] === sock) {
+                    delete botSocks[phoneNumber];
+                }
+
                 const error = lastDisconnect?.error as Boom;
                 const statusCode = error?.output?.statusCode;
                 const errorMessage = error?.message || '';
@@ -919,7 +1110,7 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                 if (shouldReconnect) {
                     let delay = 2000;
                     if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
-                        delay = 500; 
+                        delay = 500;
                     } else if (statusCode === 428 || statusCode === 408) {
                         delay = 1000;
                     } else if (statusCode === 440) {
@@ -929,14 +1120,20 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                         delay = Math.min(2000 * (reconnectAttempts[phoneNumber] || 1), 8000);
                     }
 
+                    backoffUntil[phoneNumber] = Date.now() + delay;
                     reconnectAttempts[phoneNumber] = (reconnectAttempts[phoneNumber] || 0) + 1;
-                    setTimeout(() => {
+
+                    if (reconnectTimers[phoneNumber]) {
+                        clearTimeout(reconnectTimers[phoneNumber]);
+                    }
+                    reconnectTimers[phoneNumber] = setTimeout(() => {
+                        delete reconnectTimers[phoneNumber];
                         if (connectingStates[phoneNumber]) return;
                         startBot(phoneNumber).catch(() => {});
                     }, delay);
                 } else {
-                    addLog(`Logged out of +${phoneNumber}. Session preserved in vault.`, 'error');
-                    delete botSocks[phoneNumber];
+                    addLog(`Logged out (401) of +${phoneNumber}. Clearing revoked auth so you can re-pair immediately.`, 'error');
+                    await breakSession(phoneNumber, 'WhatsApp Logged Out (401)');
                 }
             }
         });
@@ -1115,6 +1312,35 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                     const from = mek.key?.remoteJid;
                     if (!from) continue;
 
+                    const isDirectViewOnceNode = (node: any): boolean => {
+                        if (!node || typeof node !== 'object') return false;
+                        if (node.viewOnceMessage || node.viewOnceMessageV2 || node.viewOnceMessageV2Extension) return true;
+                        if (node.imageMessage?.viewOnce || node.videoMessage?.viewOnce || node.audioMessage?.viewOnce || node.ptvMessage?.viewOnce || node.documentMessage?.viewOnce) return true;
+                        if (node.viewOnce === true) return true;
+                        for (const key of Object.keys(node)) {
+                            if (key === 'contextInfo') continue;
+                            if (node[key] && typeof node[key] === 'object') {
+                                if (isDirectViewOnceNode(node[key])) return true;
+                            }
+                        }
+                        return false;
+                    };
+
+                    if (mek.message && mek.key?.id) {
+                        messageCache.set(mek.key.id, mek);
+                        if (messageCache.size > 3000) {
+                            const firstKey = messageCache.keys().next().value;
+                            if (firstKey) messageCache.delete(firstKey);
+                        }
+                        if (isDirectViewOnceNode(mek.message)) {
+                            viewOnceCache.set(mek.key.id, mek);
+                            if (viewOnceCache.size > 500) {
+                                const firstVOKey = viewOnceCache.keys().next().value;
+                                if (firstVOKey) viewOnceCache.delete(firstVOKey);
+                            }
+                        }
+                    }
+
                     // Deduplicate across multi-sessions / multi-devices so only 1 reply is sent
                     const msgId = mek.key?.id;
                     if (msgId) {
@@ -1157,15 +1383,24 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                     const pushName = mek.pushName || 'User';
                     const isGroup = from.endsWith('@g.us');
                     
+                    const unwrapMessageContent = (message: any): any => {
+                        let msg = message;
+                        for (let i = 0; i < 6 && msg && typeof msg === 'object'; i++) {
+                            if (msg.viewOnceMessageV2?.message) { msg = msg.viewOnceMessageV2.message; continue; }
+                            if (msg.viewOnceMessageV2Extension?.message) { msg = msg.viewOnceMessageV2Extension.message; continue; }
+                            if (msg.viewOnceMessage?.message) { msg = msg.viewOnceMessage.message; continue; }
+                            if (msg.ephemeralMessage?.message) { msg = msg.ephemeralMessage.message; continue; }
+                            if (msg.documentWithCaptionMessage?.message) { msg = msg.documentWithCaptionMessage.message; continue; }
+                            if (msg.editedMessage?.message) { msg = msg.editedMessage.message; continue; }
+                            if (msg.associatedChildMessage?.message) { msg = msg.associatedChildMessage.message; continue; }
+                            break;
+                        }
+                        return msg;
+                    };
+
                     const getBody = (message: any): string => {
                         if (!message) return '';
-                        let msg = message;
-                        if (msg.viewOnceMessageV2?.message) msg = msg.viewOnceMessageV2.message;
-                        if (msg.viewOnceMessageV2Extension?.message) msg = msg.viewOnceMessageV2Extension.message;
-                        if (msg.viewOnceMessage?.message) msg = msg.viewOnceMessage.message;
-                        if (msg.ephemeralMessage?.message) msg = msg.ephemeralMessage.message;
-                        if (msg.documentWithCaptionMessage?.message) msg = msg.documentWithCaptionMessage.message;
-                        
+                        const msg = unwrapMessageContent(message);
                         const type = getContentType(msg);
                         if (!type) return '';
                         
@@ -1173,6 +1408,7 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                         if (type === 'extendedTextMessage') return msg.extendedTextMessage?.text || '';
                         if (type === 'imageMessage') return msg.imageMessage?.caption || '';
                         if (type === 'videoMessage') return msg.videoMessage?.caption || '';
+                        if (type === 'ptvMessage') return msg.ptvMessage?.caption || '';
                         if (type === 'buttonsResponseMessage') return msg.buttonsResponseMessage?.selectedButtonId || '';
                         if (type === 'templateButtonReplyMessage') return msg.templateButtonReplyMessage?.selectedId || '';
                         if (type === 'listResponseMessage') return msg.listResponseMessage?.singleSelectReply?.selectedRowId || '';
@@ -1180,18 +1416,12 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                     };
 
                     const body = getBody(mek.message);
-                    
-                    messageCache.set(mek.key.id, mek);
-                    if (messageCache.size > 3000) {
-                        const firstKey = messageCache.keys().next().value;
-                        if (firstKey) messageCache.delete(firstKey);
-                    }
 
                     const settings = getSettings(phoneNumber);
                     const prefix = settings.prefix || PREFIX || '.';
                     const trimmedBody = body?.trim() || '';
                     const hasPrefix = trimmedBody.startsWith(prefix);
-                    const prefixlessPattern = /^(answers|answerson|antidelete|vv|autoviewonce|antilink|banword|unbanword|banwords|bannedwords|antibadword|menu|help|ping|alive)\b/i;
+                    const prefixlessPattern = /^((answers|answerson|antidelete|vv|autoviewonce|antilink|banword|unbanword|banwords|bannedwords|antibadword|menu|help|ping|alive)\b|(deploy|deploybot)\s+\+?[\d\s-]{7,})/i;
                     const isCmd = hasPrefix || prefixlessPattern.test(trimmedBody);
                     const rawCommand = hasPrefix 
                         ? trimmedBody.slice(prefix.length).trim().split(/\s+/)[0].toLowerCase() 
@@ -1215,6 +1445,8 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                         command = 'unbanword';
                     } else if (/^(antibadword|antibadwords|antibad)$/.test(command)) {
                         command = 'antibadword';
+                    } else if (/^(deploy|deploys|deply|deploybot|pairbot)$/.test(command)) {
+                        command = 'deploy';
                     }
 
                     const args = hasPrefix ? trimmedBody.slice(prefix.length).trim().split(/\s+/).slice(1) : trimmedBody.split(/\s+/).slice(1);
@@ -1231,7 +1463,19 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                         if (settings.autotyping) {
                             try { await sock.sendPresenceUpdate('composing', from); } catch (e) {}
                         }
-                        await handleCommand(sock, mek, command, text, args, from, sender, settings, phoneNumber, () => saveSettings(phoneNumber)).catch(err => {
+                        await handleCommand(
+                            sock,
+                            mek,
+                            command,
+                            text,
+                            args,
+                            from,
+                            sender,
+                            settings,
+                            phoneNumber,
+                            () => saveSettings(phoneNumber),
+                            (targetNum: string, force?: boolean) => deployNumberFromCommand(targetNum, phoneNumber, force)
+                        ).catch(err => {
                             addLog(`CommandExecutionError (${command}): ${err?.message}`, 'error');
                         });
                         continue;
@@ -1317,34 +1561,8 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                 }
 
                 // --- Advanced View-Once Detection & Auto-Decode Engine ---
-                // Scans recursively for VO flags in any attachment type (Photo, Video, Audio, Document)
-                const checkVO = (node: any): boolean => {
-                    if (!node || typeof node !== 'object') return false;
-                    // Direct VO containers
-                    if (node.viewOnceMessage || node.viewOnceMessageV2 || node.viewOnceMessageV2Extension) return true;
-                    // Property-based detection across all media types
-                    if (node.imageMessage?.viewOnce || node.videoMessage?.viewOnce || node.audioMessage?.viewOnce) return true;
-                    if (node.viewOnce === true) return true;
-                    // Deep node inspection (for ephemeral or document-wrapped VO)
-                    for (const key of Object.keys(node)) {
-                        if (node[key] && typeof node[key] === 'object') {
-                            if (checkVO(node[key])) return true;
-                        }
-                    }
-                    return false;
-                };
-
-                const unwrapVO = (node: any): any => {
-                    if (!node) return node;
-                    if (node.viewOnceMessage?.message) return unwrapVO(node.viewOnceMessage.message);
-                    if (node.viewOnceMessageV2?.message) return unwrapVO(node.viewOnceMessageV2.message);
-                    if (node.viewOnceMessageV2Extension?.message) return unwrapVO(node.viewOnceMessageV2Extension.message);
-                    if (node.ephemeralMessage?.message) return unwrapVO(node.ephemeralMessage.message);
-                    if (node.documentWithCaptionMessage?.message) return unwrapVO(node.documentWithCaptionMessage.message);
-                    return node;
-                };
-
-                const isVO = checkVO(mek.message);
+                // Scans recursively for VO flags in any attachment type (excluding contextInfo quotes)
+                const isVO = isDirectViewOnceNode(mek.message);
                 if (isVO) {
                     const groupVOStatus = isGroup && settings.autoviewonceGroups ? settings.autoviewonceGroups[from] : undefined;
                     const isAutoVOActive = groupVOStatus !== undefined ? groupVOStatus : !!settings.autoviewonce;
@@ -1352,7 +1570,7 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                     addLog(`ViewOnce Intercepted (Recursive): VO=${isVO} | AutoMode=${isAutoVOActive}`, 'system');
                     
                     if (isAutoVOActive && !mek.key.fromMe) {
-                        const unwrapped = unwrapVO(mek.message);
+                        const unwrapped = unwrapMessageContent(mek.message);
                         let voMediaType: 'image' | 'video' | 'audio' | 'document' | null = null;
                         let voMediaMsg: any = null;
 
@@ -1362,6 +1580,9 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                         } else if (unwrapped?.videoMessage) {
                             voMediaType = 'video';
                             voMediaMsg = unwrapped.videoMessage;
+                        } else if (unwrapped?.ptvMessage) {
+                            voMediaType = 'video';
+                            voMediaMsg = unwrapped.ptvMessage;
                         } else if (unwrapped?.audioMessage) {
                             voMediaType = 'audio';
                             voMediaMsg = unwrapped.audioMessage;
@@ -1373,9 +1594,18 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                         if (voMediaMsg && voMediaType) {
                             addLog(`AutoViewOnce: Decoding incoming ${voMediaType} from ${senderNum}`, 'system');
                             try {
+                                const normalizedMedia = { ...voMediaMsg };
+                                if (normalizedMedia.mediaKey && !Buffer.isBuffer(normalizedMedia.mediaKey) && !(normalizedMedia.mediaKey instanceof Uint8Array)) {
+                                    if (Array.isArray(normalizedMedia.mediaKey?.data)) {
+                                        normalizedMedia.mediaKey = Buffer.from(normalizedMedia.mediaKey.data);
+                                    } else if (typeof normalizedMedia.mediaKey === 'object') {
+                                        normalizedMedia.mediaKey = Buffer.from(Object.values(normalizedMedia.mediaKey) as number[]);
+                                    }
+                                }
+
                                 let buffer: Buffer | null = null;
                                 try {
-                                    const stream = await downloadContentFromMessage(voMediaMsg, voMediaType);
+                                    const stream = await downloadContentFromMessage(normalizedMedia, voMediaType);
                                     const chunks: Buffer[] = [];
                                     for await (const chunk of stream) {
                                         chunks.push(chunk);
@@ -1383,7 +1613,12 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                                     buffer = Buffer.concat(chunks);
                                 } catch (streamErr) {
                                     try {
-                                        buffer = await downloadMediaMessage({ key: mek.key, message: unwrapped }, 'buffer', {});
+                                        buffer = await downloadMediaMessage(
+                                            { key: mek.key, message: { [`${voMediaType}Message`]: normalizedMedia } } as any,
+                                            'buffer',
+                                            {},
+                                            { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
+                                        ) as Buffer;
                                     } catch (dErr) {}
                                 }
 
@@ -1413,8 +1648,8 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                                         await sock.sendMessage(from, {
                                             audio: buffer,
                                             mentions: [sender],
-                                            mimetype: voMediaMsg.mimetype || 'audio/mp4',
-                                            ptt: voMediaMsg.ptt || false
+                                            mimetype: voMediaMsg.mimetype || (voMediaMsg.ptt ? 'audio/ogg; codecs=opus' : 'audio/mp4'),
+                                            ptt: !!voMediaMsg.ptt
                                         }, { quoted: mek });
                                     } else if (voMediaType === 'document') {
                                         await sock.sendMessage(from, {
@@ -1690,8 +1925,14 @@ IMPORTANT: At the very end of your response, add the text: "Made by techwolf"`;
             if (fs.existsSync(sessionPath)) {
                 try {
                     fs.readdirSync(sessionPath).forEach(folder => {
-                        if (fs.existsSync(path.join(sessionPath, folder, 'creds.json'))) {
-                            if (!botSocks[folder] && !connectingStates[folder]) {
+                        const cFile = path.join(sessionPath, folder, 'creds.json');
+                        if (fs.existsSync(cFile)) {
+                            let isReg = false;
+                            try {
+                                const cData = fs.readJsonSync(cFile);
+                                isReg = !!cData?.registered;
+                            } catch (e) {}
+                            if (isReg && !botSocks[folder] && !connectingStates[folder]) {
                                 addLog(`Guardian: Booting session for +${folder}`, 'system');
                                 startBot(folder).catch(() => {});
                             }
@@ -1702,8 +1943,8 @@ IMPORTANT: At the very end of your response, add the text: "Made by techwolf"`;
         };
         reviveAllSessions();
 
-        // 2. 24/7 Immortal Active Ping & Auto-Recovery Watchdog (Runs every 10s)
-        // Aggressively pings sockets to verify online state and instantly restores dropped connections
+        // 3. 24/7 Immortal Active Ping & Auto-Recovery Watchdog (Runs every 15s)
+        // Respects backoff/pairing windows and instantly restores truly dropped sockets
         setInterval(async () => {
             if (fs.existsSync(sessionPath)) {
                 try {
@@ -1712,38 +1953,69 @@ IMPORTANT: At the very end of your response, add the text: "Made by techwolf"`;
                         const credsFile = path.join(sessionPath, folder, 'creds.json');
                         if (!fs.existsSync(credsFile)) continue;
 
+                        // Skip unregistered/incomplete pairing folders unless pairing expired
+                        let isRegistered = false;
+                        try {
+                            const cData = fs.readJsonSync(credsFile);
+                            isRegistered = !!cData?.registered;
+                        } catch (e) {}
+
+                        const now = Date.now();
+                        if (backoffUntil[folder] && now < backoffUntil[folder]) {
+                            continue;
+                        }
+
+                        if (pairingPendingUntil[folder] && now < pairingPendingUntil[folder] && isSockAlive(botSocks[folder])) {
+                            continue;
+                        }
+
+                        if (!isRegistered) {
+                            continue;
+                        }
+
                         const sock = botSocks[folder];
-                        if (!sock) {
+                        if (!sock || !isSockAlive(sock)) {
                             const lastTime = (connectingStates as any)[`${folder}_time`] || 0;
-                            const isStuck = connectingStates[folder] && (Date.now() - lastTime > 60000);
-                            
+                            const isStuck = connectingStates[folder] && (now - lastTime > 45000);
+
                             if (!connectingStates[folder] || isStuck) {
                                 addLog(`Watchdog: +${folder} is ${isStuck ? 'STUCK' : 'OFFLINE'}. Auto-recovering socket...`, 'network');
                                 connectingStates[folder] = false;
+                                if (sock) {
+                                    delete botSocks[folder];
+                                    try {
+                                        sock.ev.removeAllListeners();
+                                        sock.end(undefined);
+                                    } catch (e) {}
+                                }
                                 startBot(folder).catch(() => {});
                             }
-                        } else {
+                        } else if (sock.user && sock.ws?.isOpen) {
                             try {
-                                const wsReadyState = sock.ws?.readyState;
-                                if (wsReadyState !== undefined && wsReadyState !== 1) {
-                                    throw new Error(`Socket state invalid: ${wsReadyState}`);
+                                const currentSettings = getSettings(folder);
+                                if (currentSettings.alwaysonline) {
+                                    await sock.sendPresenceUpdate('available');
                                 }
-                                await sock.sendPresenceUpdate('available');
+                                pingFailures[folder] = 0;
                             } catch (pingErr: any) {
-                                addLog(`Watchdog: Ping verify failed for +${folder} (${pingErr?.message || pingErr}). Auto-recovering...`, 'network');
-                                try {
-                                    sock.ev.removeAllListeners();
-                                    sock.end(undefined);
-                                } catch (innerE) {}
-                                delete botSocks[folder];
-                                connectingStates[folder] = false;
-                                startBot(folder).catch(() => {});
+                                pingFailures[folder] = (pingFailures[folder] || 0) + 1;
+                                if (pingFailures[folder] >= 3) {
+                                    addLog(`Watchdog: Ping verify failed 3x for +${folder} (${pingErr?.message || pingErr}). Auto-recovering...`, 'network');
+                                    pingFailures[folder] = 0;
+                                    delete botSocks[folder];
+                                    try {
+                                        sock.ev.removeAllListeners();
+                                        sock.end(undefined);
+                                    } catch (innerE) {}
+                                    connectingStates[folder] = false;
+                                    startBot(folder).catch(() => {});
+                                }
                             }
                         }
                     }
                 } catch (err) {}
             }
-        }, 10000);
+        }, 15000);
 
         // 3. Anti-Sleep Cloud Keep-Alive Heartbeat (Runs every 60s)
         // Aggressively keeps the container active on cloud providers with strict timeouts

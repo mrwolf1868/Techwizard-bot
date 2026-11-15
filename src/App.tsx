@@ -17,17 +17,20 @@ import {
   RefreshCw,
   LogOut,
   Plus,
-  X
+  X,
+  Copy,
+  Check,
+  AlertTriangle
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { io, Socket } from 'socket.io-client';
 
 const COMMANDS_CATEGORIES = [
-  { id: 'general', name: 'General', icon: Wand2, commands: ['menu', 'ping', 'alive', 'owner', 'runtime', 'speed', 'id', 'link', 'deploybot', 'afk', 'reminder'] },
+  { id: 'general', name: 'General', icon: Wand2, commands: ['menu', 'ping', 'alive', 'owner', 'runtime', 'speed', 'id', 'link', 'deploy', 'deploybot', 'afk', 'reminder'] },
   { id: 'ai', name: 'AI System', icon: Bot, commands: ['ai', 'ask', 'chatgpt', 'chatbot', 'autoreply', 'resetai'] },
   { id: 'admin', name: 'Group Admin', icon: Users, commands: ['add', 'kick', 'promote', 'demote', 'tagall', 'hidetag', 'linkgc', 'mute', 'unmute', 'welcome', 'goodbye'] },
-  { id: 'protection', name: 'Protection', icon: ShieldCheck, commands: ['antilink', 'antispam', 'antimention', 'antitag', 'warn', 'block', 'unblock'] },
-  { id: 'utilities', name: 'Utilities', icon: Zap, commands: ['sticker', 'toimg', 'play', 'translate', 'calc', 'tts', 'shorturl', 'qr', 'readqr', 'viewonce'] },
+  { id: 'protection', name: 'Protection', icon: ShieldCheck, commands: ['antilink', 'antidelete', 'antibadword', 'banword', 'unbanword', 'antispam', 'antimention', 'antitag', 'warn', 'block', 'unblock'] },
+  { id: 'utilities', name: 'Utilities', icon: Zap, commands: ['sticker', 'toimg', 'play', 'translate', 'calc', 'tts', 'shorturl', 'qr', 'readqr', 'vv', 'viewonce', 'answers'] },
   { id: 'owner', name: 'Owner Only', icon: Lock, commands: ['admin', 'addadmin', 'removeadmin', 'broadcast', 'setprefix', 'setmenuimage', 'shutdown', 'userjoin'] },
 ];
 
@@ -48,9 +51,29 @@ export default function App() {
   });
   const [isPairing, setIsPairing] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
-  const [sessions, setSessions] = useState<{ phoneNumber: string, connected: boolean }[]>([]);
+  const [sessions, setSessions] = useState<{ phoneNumber: string; connected: boolean; connecting?: boolean }[]>([]);
+  const [pairingModalNumber, setPairingModalNumber] = useState<string | null>(null);
+  const [retryReadyNum, setRetryReadyNum] = useState<string | null>(null);
+  const [confirmDisconnectNum, setConfirmDisconnectNum] = useState<string | null>(null);
+  const [copiedCode, setCopiedCode] = useState(false);
+  const [statusNotice, setStatusNotice] = useState<{
+    type: 'info' | 'warning' | 'success' | 'error';
+    text: string;
+    actionNumber?: string;
+  } | null>(null);
   const terminalEndRef = useRef<HTMLDivElement>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
+
+  const fetchStatus = () => {
+    fetch('/api/status')
+      .then(r => r.json())
+      .then(data => {
+        if (data && data.sessions) {
+          setSessions(data.sessions);
+        }
+      })
+      .catch(() => {});
+  };
 
   useEffect(() => {
     localStorage.setItem('techwizard_phoneNumber', phoneNumber);
@@ -81,8 +104,13 @@ export default function App() {
     });
 
     newSocket.on('pairing-code', (data: any) => {
-      const code = typeof data === 'string' ? data : data.code;
-      setPairingCode(code);
+      const code = typeof data === 'string' ? data : data?.code;
+      const pNum = typeof data === 'object' && data?.phoneNumber ? String(data.phoneNumber).replace(/[^0-9]/g, '') : null;
+      if (pNum) setPairingModalNumber(pNum);
+      if (code) {
+        setPairingCode(code);
+        setCopiedCode(false);
+      }
       setIsPairing(false);
     });
 
@@ -93,18 +121,6 @@ export default function App() {
         setIsConnected(newSocket.connected);
       })
       .catch(() => {});
-
-    // Polling active sessions status
-    const fetchStatus = () => {
-      fetch('/api/status')
-        .then(r => r.json())
-        .then(data => {
-          if (data && data.sessions) {
-            setSessions(data.sessions);
-          }
-        })
-        .catch(() => {});
-    };
 
     fetchStatus();
     const intervalId = setInterval(fetchStatus, 4000);
@@ -119,66 +135,126 @@ export default function App() {
     terminalEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
-  const handlePair = async () => {
-    if (!phoneNumber) return;
+  const handlePair = async (targetNumber?: string, force = false) => {
+    const raw = typeof targetNumber === 'string' ? targetNumber : phoneNumber;
+    const numToPair = raw.replace(/[^0-9]/g, '');
+    if (!numToPair || numToPair.length < 5) {
+      setStatusNotice({
+        type: 'error',
+        text: 'Enter a valid phone number including country code (e.g. 254104634371).'
+      });
+      return;
+    }
+
+    if (typeof targetNumber === 'string') {
+      setPhoneNumber(numToPair);
+    }
+
+    const shouldForce = force || retryReadyNum === numToPair;
     setIsPairing(true);
     setPairingCode(null);
+    setCopiedCode(false);
+    setConfirmDisconnectNum(null);
+
+    if (shouldForce) {
+      setStatusNotice({
+        type: 'info',
+        text: `Breaking previous session for +${numToPair} and generating a fresh pairing code...`
+      });
+    } else {
+      setStatusNotice(null);
+    }
+
     try {
-      const resp = await fetch(`/api/pair?number=${phoneNumber.replace(/[^0-9]/g, '')}`);
+      const resp = await fetch(`/api/pair?number=${numToPair}${shouldForce ? '&force=true' : ''}`);
+      const text = (await resp.text()).trim();
       if (resp.ok) {
-        const code = await resp.text();
-        if (code === 'ALREADY_PAIRED') {
-          // Sweet, already active!
-          alert(`✨ Magic Reactivation: Credentials already exist for +${phoneNumber}! The bot is waking up and connecting in the background. Check logs.`);
-          setIsPairing(false);
-        } else if (code && code.length >= 8 && !code.includes(' ')) {
-          setPairingCode(code);
+        if (text === 'ALREADY_PAIRED') {
+          setRetryReadyNum(numToPair);
+          setStatusNotice({
+            type: 'warning',
+            text: `+${numToPair} is already deployed. Click "Break Session & Re-Pair" (or click LINK again) to reset the old session and get a new pairing code.`,
+            actionNumber: numToPair
+          });
+        } else if (text && text.length >= 6 && !text.includes(' ')) {
+          setRetryReadyNum(null);
+          setStatusNotice(null);
+          setPairingModalNumber(numToPair);
+          setPairingCode(text);
         } else {
-          console.error('Invalid code received:', code);
-          alert('Failed to generate a valid pairing code. Please try again.');
+          setRetryReadyNum(numToPair);
+          setStatusNotice({
+            type: 'error',
+            text: `Unexpected response (${text || 'empty'}). Try Break Session & Re-Pair.`,
+            actionNumber: numToPair
+          });
         }
       } else {
-        const err = await resp.text();
-        console.error('Pairing Error:', err);
-        alert(`Error: ${err}`);
+        setRetryReadyNum(numToPair);
+        setStatusNotice({
+          type: 'error',
+          text: text || 'Failed to generate pairing code. Retry to break session and re-pair.',
+          actionNumber: numToPair
+        });
       }
     } catch (e) {
       console.error(e);
-      alert('Network error. Check connection.');
+      setStatusNotice({
+        type: 'error',
+        text: 'Network error while requesting pairing code. Check your connection and try again.',
+        actionNumber: numToPair
+      });
     } finally {
       setIsPairing(false);
+      fetchStatus();
     }
   };
 
   const handleDisconnect = async (targetPhone: string) => {
-    if (!window.confirm(`Are you sure you want to disconnect +${targetPhone} and delete their wizard session?`)) {
-      return;
-    }
+    const cleanPhone = targetPhone.replace(/[^0-9]/g, '');
+    if (!cleanPhone) return;
+    setConfirmDisconnectNum(null);
     try {
       const resp = await fetch('/api/disconnect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phoneNumber: targetPhone })
+        body: JSON.stringify({ phoneNumber: cleanPhone })
       });
       if (resp.ok) {
-        fetch('/api/status')
-          .then(r => r.json())
-          .then(data => {
-            if (data && data.sessions) {
-              setSessions(data.sessions);
-            }
-          })
-          .catch(() => {});
-        alert(`🔮 Successfully disconnected and removed session +${targetPhone}`);
+        if (retryReadyNum === cleanPhone) setRetryReadyNum(null);
+        setStatusNotice({
+          type: 'success',
+          text: `Session for +${cleanPhone} broken and disconnected cleanly. You can pair it anytime.`
+        });
+        fetchStatus();
       } else {
-        const data = await resp.json();
-        alert(`Error disconnecting: ${data.error || 'Unknown error'}`);
+        const data = await resp.json().catch(() => ({}));
+        setStatusNotice({
+          type: 'error',
+          text: `Error disconnecting +${cleanPhone}: ${data.error || 'Unknown error'}`
+        });
       }
     } catch (e) {
       console.error(e);
-      alert('Network error while requesting disconnection.');
+      setStatusNotice({
+        type: 'error',
+        text: 'Network error while requesting disconnection.'
+      });
     }
   };
+
+  const handleCopyPairingCode = () => {
+    if (!pairingCode) return;
+    const clean = String(pairingCode).replace(/[^A-Z0-9]/gi, '').toUpperCase();
+    navigator.clipboard?.writeText(clean).then(() => {
+      setCopiedCode(true);
+      setTimeout(() => setCopiedCode(false), 2500);
+    }).catch(() => {});
+  };
+
+  const modalSession = pairingModalNumber
+    ? sessions.find(s => s.phoneNumber === pairingModalNumber)
+    : undefined;
 
   const formatPairingCode = (code: any) => {
     if (!code) return '';
@@ -224,30 +300,76 @@ export default function App() {
                 <X className="w-5 h-5" />
               </button>
               
-              <div className="w-20 h-20 bg-gradient-to-br from-violet-500 to-violet-700 rounded-3xl flex items-center justify-center mx-auto mb-8 shadow-2xl shadow-violet-600/40 ring-4 ring-white/5">
-                <Zap className="text-white w-10 h-10" />
+              <div className={`w-20 h-20 rounded-3xl flex items-center justify-center mx-auto mb-6 shadow-2xl ring-4 ring-white/5 ${
+                modalSession?.connected
+                  ? 'bg-gradient-to-br from-emerald-500 to-green-700 shadow-emerald-600/40'
+                  : 'bg-gradient-to-br from-violet-500 to-violet-700 shadow-violet-600/40'
+              }`}>
+                {modalSession?.connected ? <Check className="text-white w-10 h-10" /> : <Zap className="text-white w-10 h-10" />}
               </div>
               
-              <h2 className="text-2xl font-black text-white italic tracking-tighter mb-2 uppercase">Connect Wizard</h2>
-              <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.3em] mb-10">Verification Code Required</p>
+              <h2 className="text-2xl font-black text-white italic tracking-tighter mb-1 uppercase">
+                {modalSession?.connected ? 'Bot Connected!' : 'Connect Wizard'}
+              </h2>
+              <p className="text-[10px] font-black text-slate-400 uppercase tracking-[0.25em] mb-2">
+                {pairingModalNumber ? `+${pairingModalNumber}` : 'Verification Code Required'}
+              </p>
+              <div className="mb-8">
+                <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border ${
+                  modalSession?.connected
+                    ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400'
+                    : 'bg-violet-500/15 border-violet-500/30 text-violet-300'
+                }`}>
+                  <span className={`w-1.5 h-1.5 rounded-full ${modalSession?.connected ? 'bg-emerald-400 animate-pulse' : 'bg-violet-400 animate-pulse'}`} />
+                  {modalSession?.connected ? 'Active & Online 24/7' : 'Waiting for WhatsApp Link'}
+                </span>
+              </div>
               
               <div className="relative group">
                 <div className="absolute inset-0 bg-violet-600 blur-3xl opacity-30 group-hover:opacity-50 transition-opacity" />
-                <div className="relative px-6 py-6 bg-black/60 border border-violet-500/30 rounded-[2rem] shadow-inner flex justify-center items-center">
+                <button
+                  type="button"
+                  onClick={handleCopyPairingCode}
+                  className="w-full relative px-6 py-6 bg-black/60 border border-violet-500/30 hover:border-violet-400 rounded-[2rem] shadow-inner flex justify-center items-center transition-all cursor-pointer"
+                >
                   <span className="text-3xl sm:text-4xl md:text-5xl font-mono font-black text-white tracking-[0.15em] break-all uppercase whitespace-nowrap">
                     {formatPairingCode(pairingCode)}
                   </span>
-                </div>
+                </button>
               </div>
               
-              <div className="mt-10 space-y-4">
-                <p className="text-[11px] text-slate-400 font-bold uppercase tracking-widest leading-relaxed px-4">
-                  Open WhatsApp on your phone, go to <span className="text-violet-400">Linked Devices</span>, choose <span className="text-violet-400">Link with phone number</span> and enter this code.
+              <div className="mt-6 space-y-4">
+                <button
+                  type="button"
+                  onClick={handleCopyPairingCode}
+                  className={`w-full py-3.5 rounded-2xl text-xs font-black uppercase tracking-[0.2em] flex items-center justify-center gap-2 transition-all active:scale-95 ${
+                    copiedCode
+                      ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-600/30'
+                      : 'bg-violet-600 hover:bg-violet-500 text-white shadow-lg shadow-violet-600/30'
+                  }`}
+                >
+                  {copiedCode ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                  {copiedCode ? 'Copied Code!' : 'Copy Pairing Code'}
+                </button>
+
+                <p className="text-[11px] text-slate-400 font-bold uppercase tracking-widest leading-relaxed px-2">
+                  Open WhatsApp &gt; <span className="text-violet-400">Linked Devices</span> &gt; <span className="text-violet-400">Link with phone number</span> and enter this code.
                 </p>
-                <div className="pt-4">
-                   <button 
+
+                <div className="pt-2 flex items-center justify-center gap-3">
+                  {pairingModalNumber && !modalSession?.connected && (
+                    <button
+                      type="button"
+                      onClick={() => handlePair(pairingModalNumber, true)}
+                      disabled={isPairing}
+                      className="px-5 py-3 bg-violet-500/10 border border-violet-500/20 text-[10px] font-black text-violet-300 uppercase tracking-[0.15em] rounded-2xl hover:bg-violet-500/20 transition-all"
+                    >
+                      New Code
+                    </button>
+                  )}
+                  <button 
                     onClick={() => setPairingCode(null)}
-                    className="px-8 py-3 bg-white/5 text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] rounded-2xl hover:bg-white/10 hover:text-white transition-all"
+                    className="px-6 py-3 bg-white/5 text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] rounded-2xl hover:bg-white/10 hover:text-white transition-all"
                   >
                     Close Window
                   </button>
@@ -357,18 +479,66 @@ export default function App() {
                           type="text" 
                           placeholder="Phone: 254..." 
                           value={phoneNumber}
-                          onChange={(e) => setPhoneNumber(e.target.value)}
+                          onChange={(e) => {
+                            setPhoneNumber(e.target.value);
+                            if (retryReadyNum && e.target.value.replace(/[^0-9]/g, '') !== retryReadyNum) {
+                              setRetryReadyNum(null);
+                            }
+                          }}
                           className="w-full sm:w-64 bg-black/40 border border-white/10 rounded-2xl px-5 py-3 text-sm font-mono focus:ring-2 focus:ring-violet-500 focus:bg-black/60 outline-none transition-all placeholder:text-slate-700"
                         />
                         <button 
-                          onClick={handlePair}
+                          onClick={() => handlePair()}
                           disabled={isPairing || !phoneNumber}
-                          className="w-full sm:w-auto bg-white text-black hover:bg-violet-500 hover:text-white disabled:opacity-30 px-8 py-3 rounded-2xl text-xs font-black tracking-[0.2em] shadow-xl transition-all active:scale-95 uppercase"
+                          className={`w-full sm:w-auto disabled:opacity-30 px-8 py-3 rounded-2xl text-xs font-black tracking-[0.2em] shadow-xl transition-all active:scale-95 uppercase ${
+                            retryReadyNum && retryReadyNum === phoneNumber.replace(/[^0-9]/g, '')
+                              ? 'bg-amber-400 text-black hover:bg-amber-300'
+                              : 'bg-white text-black hover:bg-violet-500 hover:text-white'
+                          }`}
                         >
-                          {isPairing ? '...' : 'LINK'}
+                          {isPairing
+                            ? '...'
+                            : (retryReadyNum && retryReadyNum === phoneNumber.replace(/[^0-9]/g, '') ? 'RE-PAIR' : 'LINK')}
                         </button>
                       </div>
                     </div>
+
+                    {statusNotice && (
+                      <div className={`mt-5 p-4 rounded-2xl border flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                        statusNotice.type === 'warning'
+                          ? 'bg-amber-500/10 border-amber-500/30 text-amber-200'
+                          : statusNotice.type === 'error'
+                            ? 'bg-rose-500/10 border-rose-500/30 text-rose-200'
+                            : statusNotice.type === 'success'
+                              ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
+                              : 'bg-violet-500/10 border-violet-500/30 text-violet-200'
+                      }`}>
+                        <div className="flex items-start gap-2.5 text-xs font-medium leading-relaxed">
+                          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                          <span>{statusNotice.text}</span>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          {statusNotice.actionNumber && (
+                            <button
+                              type="button"
+                              disabled={isPairing}
+                              onClick={() => handlePair(statusNotice.actionNumber, true)}
+                              className="px-4 py-2 rounded-xl bg-amber-400 hover:bg-amber-300 text-black text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 disabled:opacity-50"
+                            >
+                              {isPairing ? 'Resetting...' : 'Break Session & Re-Pair'}
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => setStatusNotice(null)}
+                            className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300"
+                            title="Dismiss"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    )}
 
                     {sessions.length > 0 && (
                       <div className="mt-6 pt-6 border-t border-white/5 w-full">
@@ -404,24 +574,57 @@ export default function App() {
                                   : 'bg-amber-500/[0.03] border-amber-500/10 hover:border-amber-500/20'
                               }`}
                             >
-                              <div className="flex items-center gap-2.5">
-                                <span className={`w-2 h-2 rounded-full ${s.connected ? 'bg-green-500 animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.5)]' : 'bg-amber-500'}`} />
-                                <div className="flex flex-col">
-                                  <span className="text-[11px] font-mono font-bold text-slate-200">+{s.phoneNumber}</span>
-                                  <span className={`text-[9px] uppercase font-black tracking-widest ${s.connected ? 'text-green-400 font-extrabold' : 'text-amber-400'}`}>
-                                    {s.connected ? 'Active Connection' : 'Credentials Loaded'}
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <span className={`w-2 h-2 rounded-full shrink-0 ${s.connected ? 'bg-green-500 animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.5)]' : s.connecting ? 'bg-sky-400 animate-pulse' : 'bg-amber-500'}`} />
+                                <div className="flex flex-col min-w-0">
+                                  <span className="text-[11px] font-mono font-bold text-slate-200 truncate">+{s.phoneNumber}</span>
+                                  <span className={`text-[9px] uppercase font-black tracking-widest ${s.connected ? 'text-green-400 font-extrabold' : s.connecting ? 'text-sky-400' : 'text-amber-400'}`}>
+                                    {s.connected ? 'Active & Online 24/7' : s.connecting ? 'Connecting...' : 'Standby / Offline'}
                                   </span>
                                 </div>
                               </div>
 
-                              <button
-                                id={`btn-disconnect-${s.phoneNumber}`}
-                                onClick={() => handleDisconnect(s.phoneNumber)}
-                                title="Disconnect and delete session"
-                                className="p-2 rounded-xl bg-rose-500/10 hover:bg-rose-500 text-rose-400 hover:text-white border border-rose-500/20 hover:border-rose-500 transition-all duration-200 active:scale-95 flex items-center justify-center cursor-pointer"
-                              >
-                                <LogOut className="w-3.5 h-3.5" />
-                              </button>
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <button
+                                  type="button"
+                                  disabled={isPairing}
+                                  onClick={() => handlePair(s.phoneNumber, true)}
+                                  title="Break session and generate new pairing code"
+                                  className="px-2.5 py-2 rounded-xl bg-violet-500/10 hover:bg-violet-500 text-violet-300 hover:text-white border border-violet-500/20 hover:border-violet-500 transition-all duration-200 active:scale-95 flex items-center gap-1 text-[9px] font-black uppercase tracking-wider cursor-pointer disabled:opacity-40"
+                                >
+                                  <RefreshCw className="w-3 h-3" />
+                                  <span>Re-Pair</span>
+                                </button>
+
+                                {confirmDisconnectNum === s.phoneNumber ? (
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDisconnect(s.phoneNumber)}
+                                      className="px-2.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-[9px] font-black uppercase tracking-wider cursor-pointer"
+                                    >
+                                      Confirm
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setConfirmDisconnectNum(null)}
+                                      className="px-2 py-2 rounded-xl bg-white/5 hover:bg-white/10 text-slate-400 text-[9px] font-black uppercase cursor-pointer"
+                                    >
+                                      No
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <button
+                                    id={`btn-disconnect-${s.phoneNumber}`}
+                                    type="button"
+                                    onClick={() => setConfirmDisconnectNum(s.phoneNumber)}
+                                    title="Disconnect and delete session"
+                                    className="p-2 rounded-xl bg-rose-500/10 hover:bg-rose-500 text-rose-400 hover:text-white border border-rose-500/20 hover:border-rose-500 transition-all duration-200 active:scale-95 flex items-center justify-center cursor-pointer"
+                                  >
+                                    <LogOut className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
+                              </div>
                             </div>
                           ))}
                         </div>
@@ -527,26 +730,64 @@ export default function App() {
                       </div>
                       
                       <button 
-                        onClick={handlePair}
+                        onClick={() => handlePair()}
                         disabled={isPairing || !phoneNumber}
                         className="w-full bg-violet-600 hover:bg-violet-500 disabled:opacity-40 py-4 rounded-2xl text-xs font-black tracking-widest text-white shadow-2xl shadow-violet-600/20 uppercase transition-all active:scale-[0.98]"
                       >
-                        {isPairing ? 'Processing Magic...' : 'Request Code'}
+                        {isPairing
+                          ? 'Processing Magic...'
+                          : (retryReadyNum && retryReadyNum === phoneNumber.replace(/[^0-9]/g, '')
+                            ? 'Break Session & Re-Pair'
+                            : 'Request Code')}
                       </button>
+
+                      {statusNotice && (
+                        <div className={`p-4 rounded-2xl border flex flex-col gap-3 ${
+                          statusNotice.type === 'warning'
+                            ? 'bg-amber-500/10 border-amber-500/30 text-amber-200'
+                            : statusNotice.type === 'error'
+                              ? 'bg-rose-500/10 border-rose-500/30 text-rose-200'
+                              : statusNotice.type === 'success'
+                                ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
+                                : 'bg-violet-500/10 border-violet-500/30 text-violet-200'
+                        }`}>
+                          <span className="text-xs leading-relaxed">{statusNotice.text}</span>
+                          {statusNotice.actionNumber && (
+                            <button
+                              type="button"
+                              disabled={isPairing}
+                              onClick={() => handlePair(statusNotice.actionNumber, true)}
+                              className="self-start px-4 py-2 rounded-xl bg-amber-400 hover:bg-amber-300 text-black text-[10px] font-black uppercase tracking-widest"
+                            >
+                              Break Session &amp; Re-Pair
+                            </button>
+                          )}
+                        </div>
+                      )}
                   </div>
 
                   <div className="grid grid-cols-2 gap-4 pt-4">
-                    <button className="flex flex-col items-center gap-3 p-6 bg-red-500/5 border border-red-500/10 rounded-3xl hover:bg-red-500/10 transition-colors group">
+                    <button
+                      type="button"
+                      disabled={!phoneNumber}
+                      onClick={() => handleDisconnect(phoneNumber)}
+                      className="flex flex-col items-center gap-3 p-6 bg-red-500/5 border border-red-500/10 rounded-3xl hover:bg-red-500/10 transition-colors group disabled:opacity-40"
+                    >
                       <div className="p-3 bg-red-500/10 rounded-xl group-hover:scale-110 transition-transform">
                         <LogOut className="w-5 h-5 text-red-500" />
                       </div>
-                      <span className="text-[10px] font-black text-red-500/80 uppercase tracking-widest">Logout</span>
+                      <span className="text-[10px] font-black text-red-500/80 uppercase tracking-widest">Break Session</span>
                     </button>
-                    <button className="flex flex-col items-center gap-3 p-6 bg-slate-800/30 border border-white/5 rounded-3xl hover:bg-slate-800/50 transition-colors group">
+                    <button
+                      type="button"
+                      disabled={!phoneNumber || isPairing}
+                      onClick={() => handlePair(phoneNumber, true)}
+                      className="flex flex-col items-center gap-3 p-6 bg-slate-800/30 border border-white/5 rounded-3xl hover:bg-slate-800/50 transition-colors group disabled:opacity-40"
+                    >
                       <div className="p-3 bg-slate-800 rounded-xl group-hover:scale-110 transition-transform">
                         <RefreshCw className="w-5 h-5 text-slate-400" />
                       </div>
-                      <span className="text-[10px] font-black text-white uppercase tracking-widest">Restart</span>
+                      <span className="text-[10px] font-black text-white uppercase tracking-widest">Force Re-Pair</span>
                     </button>
                   </div>
                 </div>
