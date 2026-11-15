@@ -20,8 +20,12 @@ const getGeminiModel = () => {
     return genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 };
 
-export async function getAIReply(chatId: string, text: string, imageBuffer?: Buffer) {
+export const SHENG_CHATBOT_PROMPT =
+    'You are TechWizard, a witty, street-smart Kenyan WhatsApp chatbot. ALWAYS reply in natural Kenyan Sheng (authentic Nairobi slang mixing Kiswahili, English, and Sheng such as "Niaje msee", "Fiti sana", "Buda", "Mambo iko shwari", "Usijali", "Cheki", "Sawa bazenga", "Maze", "Ngori", "Poa sana", "Aje"). Keep your replies natural, conversational, helpful, and concise in Sheng. Never switch to stiff formal English.';
+
+export async function getAIReply(chatId: string, text: string, imageBuffer?: Buffer, customSystemPrompt?: string) {
     const history = conversationMemory[chatId] || [];
+    const systemPrompt = customSystemPrompt || "You are TechWizard, a smart and friendly WhatsApp assistant. Be helpful, concise, and energetic.";
     
     // Try TechWiz Endpoints in parallel for maximum speed
     const techWizPromises = ENDPOINTS.map(endpoint => {
@@ -35,7 +39,7 @@ export async function getAIReply(chatId: string, text: string, imageBuffer?: Buf
             }
 
             const messages = [
-                { role: "system", content: "You are TechWizard, a smart and friendly WhatsApp assistant. Be helpful, concise, and energetic." },
+                { role: "system", content: systemPrompt },
                 ...history.map(h => ({ role: h.role === 'model' ? 'assistant' : h.role, content: h.content })),
                 { role: "user", content: content }
             ];
@@ -95,8 +99,8 @@ export async function getAIReply(chatId: string, text: string, imageBuffer?: Buf
 
             const result = await model.generateContent({
                 contents: [
-                    { role: 'user', parts: [{ text: "You are TechWizard, a fast and smart WhatsApp bot. Keep your replies concise, helpful, and energetic." }] },
-                    { role: 'model', parts: [{ text: "Understood! I'm ready to help. 🧙‍♂️" }] },
+                    { role: 'user', parts: [{ text: systemPrompt }] },
+                    { role: 'model', parts: [{ text: customSystemPrompt ? "Sawa msee! Niko rada, niambie chenye unataka." : "Understood! I'm ready to help. 🧙‍♂️" }] },
                     ...historyForGemini,
                     { role: 'user', parts: promptParts }
                 ],
@@ -117,7 +121,9 @@ export async function getAIReply(chatId: string, text: string, imageBuffer?: Buf
     }
 
     // 3. Last Resort - Nice User Message
-    return "🧙‍♂️ _The wizard is briefly resting. I'll be back to help you in just a moment!_";
+    return customSystemPrompt
+        ? "🧙‍♂️ _Maze nimetulia kidogo tu buda, rudi baada ya sekunde chache!_"
+        : "🧙‍♂️ _The wizard is briefly resting. I'll be back to help you in just a moment!_";
 }
 
 export function resetAI(chatId: string) {

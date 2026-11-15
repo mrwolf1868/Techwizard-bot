@@ -26,7 +26,7 @@ import { createServer as createViteServer } from 'vite';
 import { Server } from 'socket.io';
 import { createServer } from 'http';
 import { EventEmitter } from 'events';
-import { getAIReply } from './src/ai.ts';
+import { getAIReply, SHENG_CHATBOT_PROMPT } from './src/ai.ts';
 import { handleCommand } from './src/commands.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -830,7 +830,64 @@ async function startServer() {
         const msgRetryCounterCache = new NodeCache({ stdTTL: 5 * 60, useClones: false });
         const messageCache = new Map<string, any>();
         const viewOnceCache = new Map<string, any>();
+        const latestViewOnceByChat = new Map<string, string>();
+        const voCacheFile = path.join(sessionPath, 'vo_cache.json');
         const botDeletedMessageIds = new Set<string>();
+
+        // Restore persisted View-Once cache across restarts/redeploys
+        const decodeCachedBuffers = (val: any): any => {
+            if (!val || typeof val !== 'object') return val;
+            if (val.__voB64 && typeof val.data === 'string') {
+                return Buffer.from(val.data, 'base64');
+            }
+            if (Array.isArray(val)) return val.map(decodeCachedBuffers);
+            const out: any = {};
+            for (const k of Object.keys(val)) {
+                out[k] = decodeCachedBuffers(val[k]);
+            }
+            return out;
+        };
+
+        const encodeCachedBuffers = (val: any): any => {
+            if (Buffer.isBuffer(val) || val instanceof Uint8Array) {
+                return { __voB64: true, data: Buffer.from(val).toString('base64') };
+            }
+            if (!val || typeof val !== 'object') return val;
+            if (Array.isArray(val)) return val.map(encodeCachedBuffers);
+            const out: any = {};
+            for (const k of Object.keys(val)) {
+                out[k] = encodeCachedBuffers(val[k]);
+            }
+            return out;
+        };
+
+        const saveViewOnceCache = () => {
+            try {
+                const entries = Array.from(viewOnceCache.entries()).slice(-100);
+                const payload = {
+                    entries: entries.map(([id, m]) => [id, encodeCachedBuffers(m)]),
+                    latest: Array.from(latestViewOnceByChat.entries())
+                };
+                fs.ensureDirSync(path.dirname(voCacheFile));
+                fs.writeJsonSync(voCacheFile, payload);
+            } catch (e) {}
+        };
+
+        if (fs.existsSync(voCacheFile)) {
+            try {
+                const raw = fs.readJsonSync(voCacheFile);
+                if (Array.isArray(raw?.entries)) {
+                    for (const [id, msg] of raw.entries) {
+                        if (id && msg) viewOnceCache.set(id, decodeCachedBuffers(msg));
+                    }
+                }
+                if (Array.isArray(raw?.latest)) {
+                    for (const [jid, id] of raw.latest) {
+                        if (jid && id) latestViewOnceByChat.set(jid, id);
+                    }
+                }
+            } catch (e) {}
+        }
 
         const sock = makeWASocket({
             version,
@@ -931,6 +988,13 @@ async function startServer() {
         };
 
         (sock as any).loadMessage = async (_jid: string, id: string) => {
+            if (!id) return undefined;
+            return viewOnceCache.get(id) || messageCache.get(id);
+        };
+
+        (sock as any).getLatestViewOnce = async (jid: string) => {
+            if (!jid) return undefined;
+            const id = latestViewOnceByChat.get(jid);
             if (!id) return undefined;
             return viewOnceCache.get(id) || messageCache.get(id);
         };
@@ -1334,10 +1398,12 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                         }
                         if (isDirectViewOnceNode(mek.message)) {
                             viewOnceCache.set(mek.key.id, mek);
+                            latestViewOnceByChat.set(from, mek.key.id);
                             if (viewOnceCache.size > 500) {
                                 const firstVOKey = viewOnceCache.keys().next().value;
                                 if (firstVOKey) viewOnceCache.delete(firstVOKey);
                             }
+                            saveViewOnceCache();
                         }
                     }
 
@@ -1594,13 +1660,18 @@ Type *${prefix}menu* or *${prefix}help* to explore your admin utilities, group m
                         if (voMediaMsg && voMediaType) {
                             addLog(`AutoViewOnce: Decoding incoming ${voMediaType} from ${senderNum}`, 'system');
                             try {
-                                const normalizedMedia = { ...voMediaMsg };
-                                if (normalizedMedia.mediaKey && !Buffer.isBuffer(normalizedMedia.mediaKey) && !(normalizedMedia.mediaKey instanceof Uint8Array)) {
-                                    if (Array.isArray(normalizedMedia.mediaKey?.data)) {
-                                        normalizedMedia.mediaKey = Buffer.from(normalizedMedia.mediaKey.data);
-                                    } else if (typeof normalizedMedia.mediaKey === 'object') {
-                                        normalizedMedia.mediaKey = Buffer.from(Object.values(normalizedMedia.mediaKey) as number[]);
-                                    }
+                                const normalizeMediaBufferField = (val: any) => {
+                                    if (!val || Buffer.isBuffer(val) || val instanceof Uint8Array) return val;
+                                    if (Array.isArray(val?.data)) return Buffer.from(val.data);
+                                    if (typeof val === 'object') return Buffer.from(Object.values(val) as number[]);
+                                    return val;
+                                };
+                                const normalizedMedia: any = { ...voMediaMsg };
+                                normalizedMedia.mediaKey = normalizeMediaBufferField(normalizedMedia.mediaKey);
+                                normalizedMedia.fileSha256 = normalizeMediaBufferField(normalizedMedia.fileSha256);
+                                normalizedMedia.fileEncSha256 = normalizeMediaBufferField(normalizedMedia.fileEncSha256);
+                                if (!normalizedMedia.url && normalizedMedia.directPath) {
+                                    normalizedMedia.url = `https://mmg.whatsapp.net${normalizedMedia.directPath}`;
                                 }
 
                                 let buffer: Buffer | null = null;
@@ -1775,19 +1846,21 @@ IMPORTANT: At the very end of your response, add the text: "Made by techwolf"`;
 
                 if (settings.banList.includes(sender)) continue;
 
-                if (settings.chatbot) {
+                if (settings.chatbot && body) {
                     const meJid = sock.user?.id ? (sock.user.id.includes(':') ? sock.user.id.split(':')[0] + '@s.whatsapp.net' : sock.user.id) : `${phoneNumber}@s.whatsapp.net`;
-                    const mentionedJids = mek.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+                    const unwrappedChatMsg = unwrapMessageContent(mek.message);
+                    const chatCtx = unwrappedChatMsg?.extendedTextMessage?.contextInfo || unwrappedChatMsg?.imageMessage?.contextInfo || unwrappedChatMsg?.videoMessage?.contextInfo || {};
+                    const mentionedJids = chatCtx.mentionedJid || [];
                     const isMentioned = mentionedJids.includes(meJid);
-                    const isReplyToMe = mek.message?.extendedTextMessage?.contextInfo?.participant === meJid;
+                    const isReplyToMe = chatCtx.participant === meJid;
                     
                     if (isGroup && !isMentioned && !isReplyToMe) continue;
 
                     if (settings.autotyping) {
                         try { await sock.sendPresenceUpdate('composing', from); } catch (e) {}
                     }
-                    const reply = await getAIReply(from, body);
-                    await sock.sendMessage(from, { text: reply });
+                    const reply = await getAIReply(`chatbot:${from}`, body, undefined, SHENG_CHATBOT_PROMPT);
+                    await sock.sendMessage(from, { text: reply }, { quoted: mek });
                 }
             }
             } catch (e) {

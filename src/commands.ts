@@ -756,9 +756,17 @@ export const handleCommand = async (
             const ctxInfo = findContextInfo(mek.message);
             const hasQuoted = !!(ctxInfo?.quotedMessage || ctxInfo?.stanzaId);
             const directMedia = extractMediaFromNode(mek.message);
+            let latestChatVO: any = null;
+            if (!hasQuoted && !directMedia && subArg !== 'on' && subArg !== 'off' && subArg !== 'status' && subArg !== 'config') {
+                try {
+                    if (typeof sock.getLatestViewOnce === 'function') {
+                        latestChatVO = await sock.getLatestViewOnce(from);
+                    }
+                } catch (e) {}
+            }
 
             // Handle toggle / configuration commands (.vv on / .vv off / .vv status)
-            if (subArg === 'on' || subArg === 'off' || (!hasQuoted && !directMedia && (subArg === 'status' || !subArg))) {
+            if (subArg === 'on' || subArg === 'off' || subArg === 'status' || subArg === 'config' || (!hasQuoted && !directMedia && !latestChatVO && !subArg)) {
                 let canToggle = isOwner || isAdmin;
                 if (isGroup && !canToggle) {
                     try {
@@ -778,7 +786,7 @@ export const handleCommand = async (
                               `📍 *Scope:* ${isGroup ? 'This Group' : 'Global'}\n` +
                               `🔓 *Auto-Reveal Status:* ${currentStatus ? 'ON 🟢' : 'OFF 🔴'}\n\n` +
                               `*Commands:*\n` +
-                              `• \`.vv\` (reply to View Once) - Reveal it here\n` +
+                              `• \`.vv\` / \`.viewonce\` (reply to View Once) - Reveal it here\n` +
                               `• \`.vv dm\` (reply to View Once) - Reveal to your DM\n` +
                               `• \`.vv on\`  - Auto-decode incoming View Once media\n` +
                               `• \`.vv off\` - Disable automatic decoding`
@@ -834,18 +842,27 @@ export const handleCommand = async (
                 if (directMedia) {
                     candidates.push({ messageNode: mek.message, keyObj: mek.key });
                 }
+                if (latestChatVO?.message) {
+                    candidates.push({ messageNode: latestChatVO.message, keyObj: latestChatVO.key || { remoteJid: from, id: mek.key.id } });
+                }
 
                 let foundMedia: { mediaType: 'image' | 'video' | 'audio' | 'document' | 'sticker'; mediaMsg: any; msgKey: string; keyObj: any } | null = null;
                 let buffer: Buffer | null = null;
 
+                const normalizeBufField = (val: any) => {
+                    if (!val || Buffer.isBuffer(val) || val instanceof Uint8Array) return val;
+                    if (Array.isArray(val?.data)) return Buffer.from(val.data);
+                    if (typeof val === 'object') return Buffer.from(Object.values(val) as number[]);
+                    return val;
+                };
+
                 const normalizeMediaNode = (rawMedia: any) => {
-                    const copy = { ...rawMedia };
-                    if (copy.mediaKey && !Buffer.isBuffer(copy.mediaKey) && !(copy.mediaKey instanceof Uint8Array)) {
-                        if (Array.isArray(copy.mediaKey?.data)) {
-                            copy.mediaKey = Buffer.from(copy.mediaKey.data);
-                        } else if (typeof copy.mediaKey === 'object') {
-                            copy.mediaKey = Buffer.from(Object.values(copy.mediaKey) as number[]);
-                        }
+                    const copy: any = { ...rawMedia };
+                    copy.mediaKey = normalizeBufField(copy.mediaKey);
+                    copy.fileSha256 = normalizeBufField(copy.fileSha256);
+                    copy.fileEncSha256 = normalizeBufField(copy.fileEncSha256);
+                    if (!copy.url && copy.directPath) {
+                        copy.url = `https://mmg.whatsapp.net${copy.directPath}`;
                     }
                     return copy;
                 };
@@ -874,9 +891,10 @@ export const handleCommand = async (
                         }
                     } catch (streamErr) {
                         try {
+                            const safeMsgKey = extracted.msgKey === 'ptvMessage' ? 'videoMessage' : extracted.msgKey;
                             const reuploadMsg = {
                                 key: candidate.keyObj,
-                                message: { [extracted.msgKey]: normalized }
+                                message: { [safeMsgKey]: normalized }
                             };
                             const downloaded = await downloadMediaMessage(
                                 reuploadMsg as any,
